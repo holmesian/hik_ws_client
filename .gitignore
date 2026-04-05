@@ -1,0 +1,8 @@
+test_*
+
+*.pyc
+__pycache__
+
+output
+
+frames
