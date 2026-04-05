@@ -20,16 +20,19 @@
 ### URL 格式
 
 代理 URL 格式：
+
 ```
 wss://<proxy_host>:<proxy_port>/proxy/<device_ip>:<device_port>/openUrl/<auth>
 ```
 
 示例：
+
 ```
 wss://example.com:6014/proxy/[1111::2222]:559/openUrl/auth_token
 ```
 
 媒体端点 URL：
+
 ```
 wss://<proxy_host>:<proxy_port>/media?version=0.1&cipherSuites=0&sessionID=&proxy=<device>
 ```
@@ -39,6 +42,7 @@ wss://<proxy_host>:<proxy_port>/media?version=0.1&cipherSuites=0&sessionID=&prox
 ### 1. WebSocket 握手
 
 客户端发送标准 HTTP Upgrade 请求：
+
 ```
 GET /media?version=0.1&cipherSuites=0&sessionID=&proxy=[ipv6]:559 HTTP/1.1
 Host: example.com:6014
@@ -50,6 +54,7 @@ Sec-WebSocket-Protocol: v1.0.0
 ```
 
 服务器响应：
+
 ```
 HTTP/1.1 101 Switching Protocols
 Sec-WebSocket-Protocol: v1.0.0
@@ -58,24 +63,26 @@ Sec-WebSocket-Protocol: v1.0.0
 ### 2. 认证请求 (MSG_TYPE_AUTH_REQUEST = 0x02)
 
 发送 JSON 格式的认证信息：
+
 ```json
 {
-    "username": "admin",
-    "password": "",
-    "clientType": "web3.0",
-    "keyVersion": "v1",
-    "random": "uuid-without-dashes"
+  "username": "admin",
+  "password": "",
+  "clientType": "web3.0",
+  "keyVersion": "v1",
+  "random": "uuid-without-dashes"
 }
 ```
 
 ### 3. 密钥交换 (MSG_TYPE_KEY_EXCHANGE = 0x04)
 
 服务器响应认证后，下发密钥参数：
+
 ```json
 {
-    "PKD": "服务器下发的公钥数据",
-    "rand": "随机数",
-    "type": "keyExchange"
+  "PKD": "服务器下发的公钥数据",
+  "rand": "随机数",
+  "type": "keyExchange"
 }
 ```
 
@@ -92,6 +99,7 @@ Sec-WebSocket-Protocol: v1.0.0
 ```
 
 Python 实现：
+
 ```python
 def generate_secret_key(PKD: str, rand: str, username: str, password: str) -> str:
     password_md5 = hashlib.md5(password.encode()).digest()
@@ -107,6 +115,7 @@ def generate_secret_key(PKD: str, rand: str, username: str, password: str) -> st
 ### 5. 视频数据 (MSG_TYPE_VIDEO_DATA = 0x40)
 
 服务器发送加密的视频帧：
+
 - 帧头包含时间戳、帧类型、长度等信息
 - 视频数据使用 AES-CBC 加密
 - 密钥是之前生成的 secret_key
@@ -126,21 +135,22 @@ def generate_secret_key(PKD: str, rand: str, username: str, password: str) -> st
 
 ## 协议消息类型
 
-| 类型 | 名称 | 描述 |
-|------|------|------|
-| 0x01 | MSG_TYPE_HELLO | 握手 |
-| 0x02 | MSG_TYPE_AUTH_REQUEST | 认证请求 |
-| 0x03 | MSG_TYPE_AUTH_RESPONSE | 认证响应 |
-| 0x04 | MSG_TYPE_KEY_EXCHANGE | 密钥交换 |
-| 0x05 | MSG_TYPE_SESSION_ERROR | 会话错误 |
-| 0x06 | MSG_TYPE_KEEPALIVE | 心跳 |
-| 0x20 | 开始预览 | 开始媒体流预览 |
-| 0x40 | MSG_TYPE_VIDEO_DATA | 视频数据 |
-| 0x41 | MSG_TYPE_AUDIO_DATA | 音频数据 |
+| 类型 | 名称                   | 描述           |
+| ---- | ---------------------- | -------------- |
+| 0x01 | MSG_TYPE_HELLO         | 握手           |
+| 0x02 | MSG_TYPE_AUTH_REQUEST  | 认证请求       |
+| 0x03 | MSG_TYPE_AUTH_RESPONSE | 认证响应       |
+| 0x04 | MSG_TYPE_KEY_EXCHANGE  | 密钥交换       |
+| 0x05 | MSG_TYPE_SESSION_ERROR | 会话错误       |
+| 0x06 | MSG_TYPE_KEEPALIVE     | 心跳           |
+| 0x20 | 开始预览               | 开始媒体流预览 |
+| 0x40 | MSG_TYPE_VIDEO_DATA    | 视频数据       |
+| 0x41 | MSG_TYPE_AUDIO_DATA    | 音频数据       |
 
 ## 消息格式
 
 所有消息使用以下格式：
+
 ```
 ┌──────────┬────────────┬─────────────────────────────┐
 │ 1 Byte   │ 4 Bytes    │ N Bytes                      │
@@ -151,12 +161,14 @@ def generate_secret_key(PKD: str, rand: str, username: str, password: str) -> st
 ## WebSocket 帧
 
 客户端发送到服务器的帧必须使用掩码：
+
 - FIN = 1
 - Opcode = 0x02 (Binary)
 - MASK = 1
 - Payload = 协议消息
 
 服务器发送到客户端的帧：
+
 - FIN = 1
 - Opcode = 0x02 (Binary)
 - MASK = 0
@@ -191,7 +203,7 @@ from hik_ws_client import HikMediaClient, HikConfig, parse_proxy_url
 async def main():
     # 方式1: 从 URL 解析配置
     config = parse_proxy_url("wss://host:port/proxy/ip:port/openUrl/auth")
-    
+
     # 方式2: 直接创建配置
     config = HikConfig(
         proxy_host="host.com",
@@ -202,16 +214,16 @@ async def main():
         username="admin",
         password=""
     )
-    
+
     # 创建客户端
     client = HikMediaClient(config)
-    
+
     # 设置回调
     def on_video(data):
         print(f"Video: {len(data)} bytes")
-        
+
     client.on_video_data = on_video
-    
+
     # 运行
     await client.run()
 
@@ -244,6 +256,7 @@ hik_ws_client/
 ## 依赖
 
 ### Python 环境
+
 - Python 3.8+ (推荐 Python 3.14)
 - 虚拟环境 (推荐)
 
@@ -260,16 +273,16 @@ pip install pycryptodome
 
 ### 完整依赖列表
 
-| 包名 | 用途 | 版本要求 |
-|------|------|----------|
-| pycryptodome | AES/RSA 加密 | >= 3.23.0 |
-| (标准库) asyncio | 异步IO | Python 3.8+ |
-| (标准库) json | JSON解析 | Python 3.8+ |
-| (标准库) hashlib | MD5/SHA计算 | Python 3.8+ |
-| (标准库) hmac | HMAC计算 | Python 3.8+ |
-| (标准库) base64 | Base64编码 | Python 3.8+ |
-| (标准库) struct | 二进制打包 | Python 3.8+ |
-| (标准库) socket | 网络通信 | Python 3.8+ |
+| 包名             | 用途         | 版本要求    |
+| ---------------- | ------------ | ----------- |
+| pycryptodome     | AES/RSA 加密 | >= 3.23.0   |
+| (标准库) asyncio | 异步IO       | Python 3.8+ |
+| (标准库) json    | JSON解析     | Python 3.8+ |
+| (标准库) hashlib | MD5/SHA计算  | Python 3.8+ |
+| (标准库) hmac    | HMAC计算     | Python 3.8+ |
+| (标准库) base64  | Base64编码   | Python 3.8+ |
+| (标准库) struct  | 二进制打包   | Python 3.8+ |
+| (标准库) socket  | 网络通信     | Python 3.8+ |
 
 ### 快速安装
 
@@ -278,10 +291,8 @@ pip install pycryptodome
 cd /path/to/hik_ws_client
 python3 -m venv venv
 source venv/bin/activate
-pip install pycryptodome
+pip install -r requirements.txt
 
-# 方法2: 使用已有的 decoder 虚拟环境
-/path/to/decoder/venv/bin/pip install pycryptodome
 ```
 
 ## 视频帧显示和处理
@@ -311,15 +322,15 @@ async def main():
     url = "wss://..."
     config = parse_proxy_url(url)
     client = HikMediaClient(config)
-    
+
     # 设置视频帧回调
     def on_video_frame(data: bytes):
         # data 是原始视频帧数据
         print(f"Received video frame: {len(data)} bytes")
         # 在这里可以实现解码和显示
-        
+
     client.on_video_data = on_video_frame
-    
+
     # 运行
     await client.run()
 
@@ -329,11 +340,13 @@ asyncio.run(main())
 #### 方法3: 集成 OpenCV 显示（需要额外解码）
 
 完整的视频显示需要：
+
 1. 解析 RTP 头获取视频数据
 2. 解码 H.264/H.265
 3. 使用 OpenCV/PyGame 显示
 
 示例框架：
+
 ```python
 import cv2
 import numpy as np
