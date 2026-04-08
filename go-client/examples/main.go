@@ -41,8 +41,8 @@ func fetchStream(ctx context.Context, proxyURL string, streamID string, saveScre
 
 	var saver *hikws.VideoSaver
 	if saveScreenshots {
-		// Launch saver that saves 1 frame every 5 seconds
-		saver, err = hikws.NewVideoSaver(ctx, "./output", streamID, 5)
+		// Launch saver that saves 1 frame every second
+		saver, err = hikws.NewVideoSaver(ctx, "./output", streamID, 1)
 		if err != nil {
 			log.Printf("Stream %s: Warning failed to start video saver: %v\n", streamID, err)
 		} else {
@@ -50,12 +50,19 @@ func fetchStream(ctx context.Context, proxyURL string, streamID string, saveScre
 		}
 	}
 
+	videoFrames := 0
+	videoBytes := 0
 	client.OnVideoData = func(data []byte) {
-		// write data to ffmpeg screenshot process if saver exists
+		videoFrames++
+		videoBytes += len(data)
+		if videoFrames <= 5 {
+			log.Printf("Stream %s: video frame #%d: %d bytes\n", streamID, videoFrames, len(data))
+		} else if videoFrames == 6 {
+			log.Printf("Stream %s: ... (suppressing further logs)\n", streamID)
+		}
 		if saver != nil {
 			_, _ = saver.Write(data)
 		}
-		// log.Printf("Stream %s: received %d bytes\n", streamID, len(data))
 	}
 
 	client.OnError = func(e error) {
@@ -64,6 +71,7 @@ func fetchStream(ctx context.Context, proxyURL string, streamID string, saveScre
 
 	// Blocks until ctx completes or session drops
 	client.Run(ctx)
+	log.Printf("Stream %s: ended. Total: %d frames, %d bytes\n", streamID, videoFrames, videoBytes)
 }
 
 func main() {

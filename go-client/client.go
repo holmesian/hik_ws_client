@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 
@@ -24,8 +25,7 @@ type HikMediaClient struct {
 	OnAudioData func([]byte)
 	OnError     func(error)
 
-	buffer []byte
-	mu     sync.Mutex
+	mu sync.Mutex
 }
 
 func NewHikMediaClient(config *HikConfig) *HikMediaClient {
@@ -114,88 +114,90 @@ func (c *HikMediaClient) Realplay() error {
 	}
 
 	reqBytes, _ := json.Marshal(reqData)
+	log.Printf("Sending realplay request to %s", deviceURL)
 	return c.conn.WriteMessage(websocket.TextMessage, reqBytes)
 }
 
+// Run processes incoming messages until context is cancelled or connection drops.
+// This matches the Python client's receive_message + run loop behavior:
+//   - Each binary WebSocket frame is unpacked ONCE (no cross-frame buffering).
+//   - If unpack succeeds with a known type → handle by type.
+//   - If unpack succeeds with an unknown type → discard (matches Python).
+//   - If unpack fails → treat entire frame payload as raw video (matches Python).
 func (c *HikMediaClient) Run(ctx context.Context) {
+	// Close the underlying connection when context is cancelled so that
+	// ReadMessage unblocks immediately (the select+default pattern alone
+	// cannot interrupt a blocking ReadMessage).
+	conn := c.conn
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			msgType, payload, err := c.conn.ReadMessage()
-			if err != nil {
-				if c.OnError != nil {
-					c.OnError(fmt.Errorf("read error: %w", err))
-				}
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			// Context cancellation is not an error
+			if ctx.Err() != nil {
 				return
 			}
+			if c.OnError != nil {
+				c.OnError(fmt.Errorf("read error: %w", err))
+			}
+			return
+		}
 
-			if msgType == websocket.TextMessage {
-				var resp map[string]interface{}
-				if err := json.Unmarshal(payload, &resp); err == nil {
-					if code, ok := resp["errorCode"].(float64); ok && code != 0 {
-						if c.OnError != nil {
-							c.OnError(fmt.Errorf("server message error: code=%v, msg=%v", code, resp["errorMsg"]))
-						}
+		if msgType == websocket.TextMessage {
+			var resp map[string]interface{}
+			if err := json.Unmarshal(payload, &resp); err == nil {
+				code, _ := resp["errorCode"].(float64)
+				if code != 0 {
+					msg, _ := resp["errorMsg"].(string)
+					errMsg := fmt.Sprintf("server error code=%.0f msg=%s", code, msg)
+					log.Print(errMsg)
+					if c.OnError != nil {
+						c.OnError(fmt.Errorf("%s", errMsg))
 					}
+				} else if sdp, ok := resp["sdp"].(string); ok && sdp != "" {
+					log.Printf("realplay OK, SDP length=%d", len(sdp))
 				}
-			} else if msgType == websocket.BinaryMessage {
-				c.buffer = append(c.buffer, payload...)
+			}
 
-				for len(c.buffer) >= 5 {
-					// Peek at first byte — only known HikProtocol types should be parsed.
-					// Raw video data (e.g. MPEG-PS starting with 0x00 0x00 0x01 0xBA)
-					// will have a first byte that is NOT a valid protocol type.
-					switch c.buffer[0] {
-					case MsgTypeVideoData, MsgTypeAudioData, MsgTypeSessionError, MsgTypeKeepAlive:
-						pType, data, remaining, err := UnpackMessage(c.buffer)
-						if err != nil {
-							// Not enough data for a complete packet, wait for more
-							if err.Error() == "insufficient length for header" || err.Error() == "insufficient length for payload" {
-								break
-							}
-							// Unexpected error, flush entire buffer as raw data
-							if c.OnVideoData != nil {
-								c.OnVideoData(c.buffer)
-							}
-							c.buffer = nil
-							break
-						}
+		} else if msgType == websocket.BinaryMessage {
+			// ---- Match Python receive_message behaviour ----
+			// Try to unpack HikProtocol header once; if it fails,
+			// treat the whole WebSocket payload as raw video.
+			pType, pData, _, unpackErr := UnpackMessage(payload)
 
-						c.buffer = remaining
-
-						switch pType {
-						case MsgTypeVideoData:
-							if c.OnVideoData != nil {
-								c.OnVideoData(data)
-							}
-						case MsgTypeAudioData:
-							if c.OnAudioData != nil {
-								c.OnAudioData(data)
-							}
-						case MsgTypeSessionError:
-							if c.OnError != nil {
-								c.OnError(fmt.Errorf("session error: %s", string(data)))
-							}
-							return
-						case MsgTypeKeepAlive:
-							// keepalive, discard
-						}
-
-					default:
-						// Unknown first byte (e.g. 0x00 from MPEG-PS header) — this is
-						// raw video data, NOT a HikProtocol message. Forward entire
-						// buffer contents to video pipeline without consuming any bytes.
-						if c.OnVideoData != nil {
-							c.OnVideoData(c.buffer)
-						}
-						c.buffer = nil
+			if unpackErr != nil {
+				// Unpack failed → raw video data (matches Python WS_OP_BINARY path)
+				log.Printf("Raw video frame: %d bytes", len(payload))
+				if c.OnVideoData != nil {
+					c.OnVideoData(payload)
+				}
+			} else {
+				switch pType {
+				case MsgTypeVideoData:
+					log.Printf("Protocol video frame: %d bytes", len(pData))
+					if c.OnVideoData != nil {
+						c.OnVideoData(pData)
 					}
-
-					if len(c.buffer) == 0 {
-						break
+				case MsgTypeAudioData:
+					if c.OnAudioData != nil {
+						c.OnAudioData(pData)
 					}
+				case MsgTypeSessionError:
+					if c.OnError != nil {
+						c.OnError(fmt.Errorf("session error: %s", string(pData)))
+					}
+					return
+				case MsgTypeKeepAlive:
+					// keepalive — discard
+				default:
+					// Unknown protocol type (e.g. 0x00 stream metadata) —
+					// discard, matching Python which has no handler for
+					// unmatched msg_types.
+					log.Printf("Protocol msg 0x%02x: %d bytes (discarded)", pType, len(pData))
 				}
 			}
 		}
