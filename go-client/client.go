@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 
@@ -101,40 +100,17 @@ func (c *HikMediaClient) Authenticate() error {
 }
 
 func (c *HikMediaClient) Realplay() error {
-	iv, key, err := GenerateClientIVKey()
-	if err != nil {
-		return err
-	}
-
-	if c.serverPKD != "" {
-		c.secretKey, err = GenerateRealplayKey(iv, key, c.serverPKD)
-		if err != nil {
-			return fmt.Errorf("failed to generate realplay key: %w", err)
-		}
-	}
-
 	deviceURL := fmt.Sprintf("ws://%s:%d/openUrl/%s", c.Config.DeviceIP, c.Config.DevicePort, c.Config.Password)
 
-	authorization, err := GenerateAuthorization(c.serverRand, c.Config.Password, key, iv)
-	if err != nil {
-		return err
-	}
-
-	token, err := GenerateToken(deviceURL, key, iv)
-	if err != nil {
-		return err
-	}
-
-	// For Hikvision backend empty keys usually trigger video
-	// The Python client explicitly left key="" but generated authorization/token.
-	// You can switch "key" to c.secretKey if it expects it.
+	// Match the Python client: send empty key/authorization/token
+	// to trigger the server to return the video stream directly.
 	reqData := map[string]interface{}{
 		"sequence":      0,
 		"cmd":           "realplay",
 		"url":           deviceURL,
 		"key":           "",
-		"authorization": authorization,
-		"token":         token,
+		"authorization": "",
+		"token":         "",
 	}
 
 	reqBytes, _ := json.Marshal(reqData)
@@ -165,49 +141,60 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					}
 				}
 			} else if msgType == websocket.BinaryMessage {
-				// Process Binary frame which could be multiple Hik Protocol messages or raw
 				c.buffer = append(c.buffer, payload...)
 
-				for {
-					pType, data, remaining, err := UnpackMessage(c.buffer)
-					if err != nil {
-						// Not enough data for a complete packet, wait for more
-						if err.Error() == "insufficient length for header" || err.Error() == "insufficient length for payload" {
+				for len(c.buffer) >= 5 {
+					// Peek at first byte — only known HikProtocol types should be parsed.
+					// Raw video data (e.g. MPEG-PS starting with 0x00 0x00 0x01 0xBA)
+					// will have a first byte that is NOT a valid protocol type.
+					switch c.buffer[0] {
+					case MsgTypeVideoData, MsgTypeAudioData, MsgTypeSessionError, MsgTypeKeepAlive:
+						pType, data, remaining, err := UnpackMessage(c.buffer)
+						if err != nil {
+							// Not enough data for a complete packet, wait for more
+							if err.Error() == "insufficient length for header" || err.Error() == "insufficient length for payload" {
+								break
+							}
+							// Unexpected error, flush entire buffer as raw data
+							if c.OnVideoData != nil {
+								c.OnVideoData(c.buffer)
+							}
+							c.buffer = nil
 							break
 						}
-						// If unpacking fails totally, might be raw video data.
-						if c.OnVideoData != nil {
-							c.OnVideoData(payload)
-						}
-						c.buffer = []byte{}
-						break
-					}
 
-					c.buffer = remaining
+						c.buffer = remaining
 
-					switch pType {
-					case MsgTypeVideoData:
-						if c.OnVideoData != nil {
-							c.OnVideoData(data)
+						switch pType {
+						case MsgTypeVideoData:
+							if c.OnVideoData != nil {
+								c.OnVideoData(data)
+							}
+						case MsgTypeAudioData:
+							if c.OnAudioData != nil {
+								c.OnAudioData(data)
+							}
+						case MsgTypeSessionError:
+							if c.OnError != nil {
+								c.OnError(fmt.Errorf("session error: %s", string(data)))
+							}
+							return
+						case MsgTypeKeepAlive:
+							// keepalive, discard
 						}
-					case MsgTypeAudioData:
-						if c.OnAudioData != nil {
-							c.OnAudioData(data)
-						}
-					case MsgTypeSessionError:
-						if c.OnError != nil {
-							c.OnError(fmt.Errorf("session error: %s", string(data)))
-						}
-						return
-					case MsgTypeKeepAlive:
-						// Keepalive pinged
+
 					default:
-						log.Printf("Received unhandled protocol message byte: 0x%02x\n", pType)
+						// Unknown first byte (e.g. 0x00 from MPEG-PS header) — this is
+						// raw video data, NOT a HikProtocol message. Forward entire
+						// buffer contents to video pipeline without consuming any bytes.
+						if c.OnVideoData != nil {
+							c.OnVideoData(c.buffer)
+						}
+						c.buffer = nil
 					}
-					
-					// Break if empty buffer
+
 					if len(c.buffer) == 0 {
-					    break
+						break
 					}
 				}
 			}
