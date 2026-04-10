@@ -28,6 +28,9 @@ type VideoSaver struct {
 	stopOnce sync.Once
 	doneCh   chan struct{}
 
+	// Callbacks
+	OnJPEGFrame func(jpegData []byte) // called for every decoded JPEG frame
+
 	// Diagnostics
 	totalWritten int64
 	mu           sync.Mutex
@@ -179,6 +182,11 @@ func (vs *VideoSaver) mjpegReader(ctx context.Context, r io.Reader) {
 			frameCount++
 			if frameCount == 1 {
 				log.Printf("VideoSaver [%s] first JPEG frame decoded: %d bytes", vs.Prefix, len(jpegData))
+			}
+
+			// Notify callback for every decoded JPEG frame
+			if vs.OnJPEGFrame != nil {
+				vs.OnJPEGFrame(jpegData)
 			}
 
 			// Save frame at configured interval

@@ -119,12 +119,10 @@ func (c *HikMediaClient) Realplay() error {
 }
 
 // Run processes incoming messages until context is cancelled or connection drops.
-// This matches the Python client's receive_message + run loop behavior:
-//   - Each binary WebSocket frame is unpacked ONCE (no cross-frame buffering).
-//   - If unpack succeeds with a known type → handle by type.
-//   - If unpack succeeds with an unknown type → discard (matches Python).
-//   - If unpack fails → treat entire frame payload as raw video (matches Python).
-func (c *HikMediaClient) Run(ctx context.Context) {
+// Returns an error if the connection was lost unexpectedly (non-nil error
+// triggers retry logic in the caller). Returns nil on graceful context
+// cancellation.
+func (c *HikMediaClient) Run(ctx context.Context) error {
 	// Close the underlying connection when context is cancelled so that
 	// ReadMessage unblocks immediately (the select+default pattern alone
 	// cannot interrupt a blocking ReadMessage).
@@ -139,12 +137,13 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 		if err != nil {
 			// Context cancellation is not an error
 			if ctx.Err() != nil {
-				return
+				return nil
 			}
+			readErr := fmt.Errorf("read error: %w", err)
 			if c.OnError != nil {
-				c.OnError(fmt.Errorf("read error: %w", err))
+				c.OnError(readErr)
 			}
-			return
+			return readErr
 		}
 
 		if msgType == websocket.TextMessage {
@@ -190,7 +189,7 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					if c.OnError != nil {
 						c.OnError(fmt.Errorf("session error: %s", string(pData)))
 					}
-					return
+					return fmt.Errorf("session error: %s", string(pData))
 				case MsgTypeKeepAlive:
 					// keepalive — discard
 				default:
