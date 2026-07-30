@@ -103,3 +103,26 @@ func main() {
 
 ---
 **注意**: 生成的图片或数据会直接落地至 `NewVideoSaver()` 第二个参数指定的目录。确保运行路径有着读写文件夹子层权限。
+
+---
+
+## 帧元信息与 SDP
+
+`realplay` 成功后，服务端会在返回文本中附带一段 SDP。库会解析它并通过
+`OnMediaInfo(*MediaInfo)` 回调暴露给调用方，包含 `Codec`（如 `H264`/`H265`）、
+`ClockRate`（通常 90000）、以及从 `sprop-parameter-sets` 的 SPS 中还原的
+`Width`/`Height`（当前支持 H.264，H.265 高度暂留 0）。这相当于把 h5player
+拿到的 SDP 以结构化形式直接交给调用方。
+
+同时，由于底层交付的是裸 H.264/H.265 annex-b 码流（与 `screenshot.go` /
+`play.py` 直接喂给 ffmpeg 的格式一致），库会对每个视频帧做 NAL 扫描，
+通过 `OnVideoFrame(*FrameMeta, []byte)` 回调给出逐帧元信息：
+
+- `IsKeyFrame`：是否含 IDR（关键帧）
+- `Codec`：来自 SDP，未携带时回退为 H.264
+- `Width`/`Height`：来自 `MediaInfo`
+- `PTS` / `TimestampMs`：码流本身不带 DTS/PTS，这里按到达时间以时钟
+  速率（或毫秒）合成的单调递增时间戳，供调用方排序使用
+
+注册 `OnVideoFrame` 时不再触发 `OnVideoData`（避免同帧重复投递）；只注册
+`OnVideoData` 的既有调用方行为不变。
