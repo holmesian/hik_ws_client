@@ -32,36 +32,54 @@ logger = logging.getLogger(__name__)
 
 
 class VideoSaver:
-    """简单的视频数据保存器"""
-    
+    """视频原始码流保存器
+
+    将收到的原始帧数据连续写入一个 dump 文件（stream_<时间戳>.raw），
+    可供后续 ffmpeg/解码器离线分析。
+    """
+
     def __init__(self, output_dir: str = "./output"):
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.frame_count = 0
+        self.total_bytes = 0
         self.start_time = time.time()
         self.last_log_time = self.start_time
-        
+        self.dump_path = self.output_dir / f"stream_{int(self.start_time)}.raw"
+        self._fp = open(self.dump_path, 'wb')
+        logger.info(f"Saving raw stream to {self.dump_path}")
+
     def save_frame(self, data: bytes):
         """保存视频帧数据"""
         self.frame_count += 1
-        
-        # 解析帧头
-        if len(data) < 20:
+        self.total_bytes += len(data)
+
+        try:
+            self._fp.write(data)
+        except OSError as e:
+            logger.error(f"Failed to write frame: {e}")
             return
-            
-        # 海康视频帧头结构 (简化)
-        # 0x24 0x34 0x00 0x00 [4字节长度] [其他信息]
-        frame_type = data[0] if len(data) > 0 else 0
-        
-        # 简单的帧类型判断
-        is_key_frame = (data[4] & 0x01) == 0x01 if len(data) > 4 else False
-        
+
         # 每秒只打印一次状态
         current_time = time.time()
         if current_time - self.last_log_time >= 1.0:
-            fps = self.frame_count / (current_time - self.start_time)
-            logger.info(f"Frames: {self.frame_count}, FPS: {fps:.2f}, Last: {len(data)} bytes")
+            elapsed = max(current_time - self.start_time, 1e-6)
+            fps = self.frame_count / elapsed
+            logger.info(
+                f"Frames: {self.frame_count}, FPS: {fps:.2f}, "
+                f"Total: {self.total_bytes / 1024:.1f} KB, Last: {len(data)} bytes")
             self.last_log_time = current_time
+
+    def close(self):
+        """关闭 dump 文件"""
+        try:
+            self._fp.flush()
+            self._fp.close()
+            logger.info(
+                f"Stream dump closed: {self.dump_path} "
+                f"({self.frame_count} frames, {self.total_bytes} bytes)")
+        except OSError:
+            pass
 
 
 async def main():
@@ -83,12 +101,13 @@ Examples:
     parser.add_argument('--port', type=int, default=6014, help='Proxy server port')
     parser.add_argument('--device-ip', help='Device IP address (can be IPv6)')
     parser.add_argument('--device-port', type=int, default=8000, help='Device port')
-    parser.add_argument('-u', '--username', default='admin', help='Username')
-    parser.add_argument('-p', '--password', default='', help='Password')
+    parser.add_argument('-u', '--username', default=None, help='Username (overrides URL)')
+    parser.add_argument('-p', '--password', default=None, help='Password (overrides URL)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
     parser.add_argument('--save-frames', action='store_true', help='Save video frames to disk')
     parser.add_argument('--output-dir', default='./output', help='Output directory for frames')
-    
+    parser.add_argument('--reconnect', action='store_true', help='Auto reconnect on failure')
+
     args = parser.parse_args()
     
     if args.verbose:
@@ -97,10 +116,10 @@ Examples:
     # 构建配置
     if args.url:
         config = parse_proxy_url(args.url)
-        # 只在命令行显式提供密码时才覆盖
-        if args.password:
+        # 只在命令行显式提供时才覆盖 URL 中解析出的值
+        if args.password is not None:
             config.password = args.password
-        if args.username != 'admin':  # 只有非默认值才覆盖
+        if args.username is not None:
             config.username = args.username
     elif args.host and args.device_ip:
         config = HikConfig(
@@ -109,8 +128,8 @@ Examples:
             proxy_path=f"/proxy/{args.device_ip}:{args.device_port}",
             device_ip=args.device_ip,
             device_port=args.device_port,
-            username=args.username,
-            password=args.password
+            username=args.username or 'admin',
+            password=args.password or ''
         )
     else:
         parser.error("Either URL or --host and --device-ip must be provided")
@@ -150,7 +169,10 @@ Examples:
     client.on_connected = on_connected
     
     try:
-        await client.run()
+        if args.reconnect:
+            await client.run_forever()
+        else:
+            await client.run()
     except KeyboardInterrupt:
         logger.info("Interrupted")
     except Exception as e:
@@ -160,6 +182,8 @@ Examples:
             traceback.print_exc()
     finally:
         await client.close()
+        if saver:
+            saver.close()
     
     return 0
 

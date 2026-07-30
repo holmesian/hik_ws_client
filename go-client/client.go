@@ -8,8 +8,16 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+)
+
+// keepaliveInterval is how often a WebSocket ping is sent to keep the
+// session alive; keepaliveWriteWait bounds each control-frame write.
+const (
+	keepaliveInterval  = 20 * time.Second
+	keepaliveWriteWait = 5 * time.Second
 )
 
 type HikMediaClient struct {
@@ -127,11 +135,37 @@ func (c *HikMediaClient) Realplay() error {
 func (c *HikMediaClient) Run(ctx context.Context) {
 	// Close the underlying connection when context is cancelled so that
 	// ReadMessage unblocks immediately (the select+default pattern alone
-	// cannot interrupt a blocking ReadMessage).
+	// cannot interrupt a blocking ReadMessage). The done channel makes the
+	// watcher goroutine exit when Run returns, avoiding a goroutine leak.
 	conn := c.conn
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		conn.Close()
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+		}
+	}()
+
+	// Periodic WebSocket ping keepalive (WriteControl is safe for
+	// concurrent use with other writes in gorilla/websocket).
+	go func() {
+		ticker := time.NewTicker(keepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				deadline := time.Now().Add(keepaliveWriteWait)
+				if err := conn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			}
+		}
 	}()
 
 	for {

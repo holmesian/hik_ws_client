@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import base64
 import hashlib
-import hmac
 import json
 import logging
 import secrets
@@ -26,7 +25,6 @@ import socket
 import ssl
 import struct
 import time
-import uuid
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from dataclasses import dataclass
@@ -223,7 +221,14 @@ class HikWebSocketClient:
     WS_OP_PING = 0x09
     WS_OP_PONG = 0x0A
 
-    def __init__(self, config: HikConfig):
+    # 网络参数
+    READ_CHUNK_SIZE = 65536          # 单次读取大小（原 8192，增大以提升吞吐）
+    MAX_BUFFER_SIZE = 64 * 1024 * 1024  # 接收缓冲上限，防止内存无限增长
+    HANDSHAKE_TIMEOUT = 15.0         # 握手超时（秒）
+
+    def __init__(self, config: HikConfig,
+                 read_timeout: Optional[float] = 60.0,
+                 keepalive_interval: Optional[float] = 20.0):
         self.config = config
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
@@ -231,28 +236,37 @@ class HikWebSocketClient:
         self.connected = False
         self.secret_key: Optional[str] = None
 
+        # 稳定性参数
+        self.read_timeout = read_timeout          # 无数据读超时（None 表示不限制）
+        self.keepalive_interval = keepalive_interval  # 心跳间隔（None 表示禁用）
+        self._keepalive_task: Optional[asyncio.Task] = None
+
         # 回调函数
         self.on_video_data: Optional[Callable[[bytes], None]] = None
         self.on_audio_data: Optional[Callable[[bytes], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
         self.on_connected: Optional[Callable[[], None]] = None
 
-        # 缓冲区
-        self.buffer = b''
+        # 缓冲区（bytearray 避免 bytes 拼接的重复拷贝）
+        self.buffer = bytearray()
+
+        # WebSocket 分片帧重组状态
+        self._frag_opcode: Optional[int] = None
+        self._frag_buffer = bytearray()
 
         # 状态机
         self.state = "disconnected"
 
+    # RFC 6455 WebSocket GUID
+    WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
     def _make_websocket_handshake(self, path: str) -> bytes:
         """生成 WebSocket 握手请求"""
         # 生成 WebSocket key
-        key = secrets.token_bytes(16)
-        accept_key = base64.b64encode(
-            hmac.new(
-                b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
-                key,
-                hashlib.sha1
-            ).digest()
+        key_b64 = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+        # 计算期望的 Sec-WebSocket-Accept（RFC 6455: SHA1(key + GUID) 的 base64）
+        self._expected_accept = base64.b64encode(
+            hashlib.sha1(key_b64.encode('ascii') + self.WS_GUID).digest()
         ).decode('ascii')
 
         # 构建 HTTP 请求
@@ -260,43 +274,29 @@ class HikWebSocketClient:
         request += f"Host: {self.config.proxy_host}:{self.config.proxy_port}\r\n"
         request += "Upgrade: websocket\r\n"
         request += "Connection: Upgrade\r\n"
-        request += f"Sec-WebSocket-Key: {base64.b64encode(key).decode('ascii')}\r\n"
+        request += f"Sec-WebSocket-Key: {key_b64}\r\n"
         request += "Sec-WebSocket-Version: 13\r\n"
         request += "Sec-WebSocket-Protocol: v1.0.0\r\n"
         request += "\r\n"
 
         return request.encode('ascii')
 
-    def _parse_websocket_handshake(self, response: bytes) -> bool:
-        """解析 WebSocket 握手响应"""
-        try:
-            # 找到 HTTP 头结束位置（\r\n\r\n）
-            # 服务器可能在 101 响应后紧跟一个 WebSocket 帧，只取 HTTP 头部分
-            header_end = response.find(b'\r\n\r\n')
-            if header_end == -1:
-                logger.error(f"WebSocket handshake failed: malformed response")
-                return False
+    def _verify_handshake_headers(self, http_header: bytes):
+        """校验握手响应头（Accept 不匹配仅告警，兼容私有服务器实现）"""
+        header_lines = http_header.decode('ascii', errors='replace').split('\r\n')
+        accept = None
+        protocol = None
+        for line in header_lines[1:]:
+            lower = line.lower()
+            if lower.startswith('sec-websocket-accept:'):
+                accept = line.split(':', 1)[1].strip()
+            elif lower.startswith('sec-websocket-protocol:'):
+                protocol = line.split(':', 1)[1].strip()
 
-            header_bytes = response[:header_end]
-            header_lines = header_bytes.decode('ascii', errors='replace').split('\r\n')
-
-            # 检查状态码
-            if not header_lines[0].startswith('HTTP/1.1 101'):
-                logger.error(f"WebSocket handshake failed: {header_lines[0]}")
-                return False
-
-            # 检查 Sec-WebSocket-Protocol
-            for line in header_lines[1:]:
-                if line.lower().startswith('sec-websocket-protocol:'):
-                    protocol = line.split(':', 1)[1].strip()
-                    logger.info(f"WebSocket protocol: {protocol}")
-                    break
-
-            logger.info("WebSocket handshake successful")
-            return True
-        except Exception as e:
-            logger.error(f"Error parsing WebSocket handshake: {e}")
-            return False
+        if protocol:
+            logger.info(f"WebSocket protocol: {protocol}")
+        if accept and accept != getattr(self, '_expected_accept', None):
+            logger.warning("Sec-WebSocket-Accept mismatch (continuing anyway)")
 
     def _make_ws_frame(self, opcode: int, payload: bytes) -> bytes:
         """生成 WebSocket 帧"""
@@ -319,18 +319,21 @@ class HikWebSocketClient:
         mask_key = secrets.token_bytes(4)
         frame.extend(mask_key)
 
-        # 掩码 payload
-        masked_payload = bytearray(payload)
-        for i in range(len(payload)):
-            masked_payload[i] ^= mask_key[i % 4]
-
-        frame.extend(masked_payload)
+        # 掩码 payload（使用大整数 XOR，比逐字节循环快一个数量级以上）
+        if payload:
+            n = len(payload)
+            mask_full = (mask_key * (n // 4 + 1))[:n]
+            masked = (int.from_bytes(payload, 'big') ^ int.from_bytes(mask_full, 'big')).to_bytes(n, 'big')
+            frame.extend(masked)
         return bytes(frame)
 
-    def _parse_ws_frame(self, data: bytes) -> tuple:
-        """解析 WebSocket 帧"""
+    def _parse_ws_frame(self, data) -> tuple:
+        """解析 WebSocket 帧
+
+        返回 (opcode, payload, remaining, is_fin)；数据不完整时 opcode 为 None。
+        """
         if len(data) < 2:
-            return None, None, data
+            return None, None, data, True
 
         # 解析第一个字节
         first_byte = data[0]
@@ -346,36 +349,36 @@ class HikWebSocketClient:
         offset = 2
         if payload_length == 126:
             if len(data) < 4:
-                return None, None, data
-            payload_length = struct.unpack('>H', data[2:4])[0]
+                return None, None, data, True
+            payload_length = struct.unpack('>H', bytes(data[2:4]))[0]
             offset = 4
         elif payload_length == 127:
             if len(data) < 10:
-                return None, None, data
-            payload_length = struct.unpack('>Q', data[2:10])[0]
+                return None, None, data, True
+            payload_length = struct.unpack('>Q', bytes(data[2:10]))[0]
             offset = 10
 
         # 客户端帧需要掩码，服务器帧不掩码
         if is_masked:
-            if len(data) < offset + 4:
-                return None, None, data
-            mask_key = data[offset:offset + 4]
+            if len(data) < offset + 4 + payload_length:
+                return None, None, data, True
+            mask_key = bytes(data[offset:offset + 4])
             offset += 4
-            if len(data) >= offset + payload_length:
-                masked_payload = bytearray(data[offset:offset + payload_length])
-                for i in range(len(masked_payload)):
-                    masked_payload[i] ^= mask_key[i % 4]
-                payload = bytes(masked_payload)
+            raw = bytes(data[offset:offset + payload_length])
+            if raw:
+                n = len(raw)
+                mask_full = (mask_key * (n // 4 + 1))[:n]
+                payload = (int.from_bytes(raw, 'big') ^ int.from_bytes(mask_full, 'big')).to_bytes(n, 'big')
             else:
                 payload = b''
         else:
             if len(data) < offset + payload_length:
-                return None, None, data
-            payload = data[offset:offset + payload_length]
+                return None, None, data, True
+            payload = bytes(data[offset:offset + payload_length])
 
         remaining = data[offset + payload_length:]
 
-        return opcode, payload, remaining
+        return opcode, payload, remaining, is_fin
 
     async def connect(self, path: str) -> bool:
         """建立 WebSocket 连接"""
@@ -386,29 +389,54 @@ class HikWebSocketClient:
             # 海康服务器可能是自签名证书，禁用验证
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
-            self.reader, self.writer = await asyncio.open_connection(
-                self.config.proxy_host,
-                self.config.proxy_port,
-                ssl=ssl_ctx
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.config.proxy_host,
+                    self.config.proxy_port,
+                    ssl=ssl_ctx
+                ),
+                timeout=self.HANDSHAKE_TIMEOUT
             )
+
+            # 开启 TCP keepalive / 关闭 Nagle，降低延迟并及时感知断链
+            try:
+                sock = self.writer.get_extra_info('socket')
+                if sock is not None:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
 
             # 发送 WebSocket 握手
             handshake_request = self._make_websocket_handshake(path)
             self.writer.write(handshake_request)
             await self.writer.drain()
 
-            # 接收握手响应
-            response = await self.reader.read(8192)
+            # 接收握手响应（循环读取直到出现完整 HTTP 头，避免响应被 TCP 分段截断）
+            response = bytearray()
+            deadline = asyncio.get_event_loop().time() + self.HANDSHAKE_TIMEOUT
+            while True:
+                remaining_time = deadline - asyncio.get_event_loop().time()
+                if remaining_time <= 0:
+                    logger.error("WebSocket handshake timeout")
+                    return False
+                chunk = await asyncio.wait_for(self.reader.read(8192), timeout=remaining_time)
+                if not chunk:
+                    logger.error("WebSocket handshake failed: connection closed by peer")
+                    return False
+                response.extend(chunk)
+                header_end = response.find(b'\r\n\r\n')
+                if header_end != -1:
+                    break
+                if len(response) > 65536:
+                    logger.error("WebSocket handshake failed: header too large")
+                    return False
 
-            # 找到 HTTP 头结束位置
-            header_end = response.find(b'\r\n\r\n')
-            if header_end == -1:
-                logger.error("WebSocket handshake failed: no header end found")
-                return False
-
-            http_header = response[:header_end]
+            http_header = bytes(response[:header_end])
             # 头之后可能紧跟一个 WebSocket 帧，先存起来
-            self.buffer = response[header_end + 4:]
+            self.buffer = bytearray(response[header_end + 4:])
+            self._frag_opcode = None
+            self._frag_buffer = bytearray()
 
             # 检查状态码
             status_line = http_header.decode('ascii', errors='replace').split('\r\n')[0]
@@ -416,37 +444,57 @@ class HikWebSocketClient:
                 logger.error(f"WebSocket handshake failed: {status_line}")
                 return False
 
+            self._verify_handshake_headers(http_header)
             logger.info("WebSocket handshake successful")
-            # 把 buffer 中的帧消费掉（服务器可能在握手后立即发帧）
 
             self.connected = True
             self.state = "connected"
+            if self.on_connected:
+                try:
+                    self.on_connected()
+                except Exception as e:
+                    logger.warning(f"on_connected callback error: {e}")
             logger.info("Connection established")
             return True
 
+        except asyncio.TimeoutError:
+            logger.error("Connection timed out")
+            return False
         except Exception as e:
             logger.error(f"Connection failed: {e}")
             return False
 
     async def close(self):
-        """关闭连接"""
+        """关闭连接（可重复调用）"""
         self.connected = False
         self.state = "disconnected"
+
+        # 停止心跳任务
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
 
         if self.writer:
             try:
                 # 发送 WebSocket 关闭帧
                 close_frame = self._make_ws_frame(self.WS_OP_CLOSE, b'')
                 self.writer.write(close_frame)
-                await self.writer.drain()
-            except:
+                await asyncio.wait_for(self.writer.drain(), timeout=2.0)
+            except Exception:
                 pass
 
-            self.writer.close()
             try:
-                await self.writer.wait_closed()
-            except:
+                self.writer.close()
+                await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+            except Exception:
                 pass
+            self.writer = None
+            self.reader = None
+
+        # 清理缓冲，避免旧数据影响下次连接
+        self.buffer = bytearray()
+        self._frag_opcode = None
+        self._frag_buffer = bytearray()
 
         logger.info("Connection closed")
 
@@ -473,63 +521,153 @@ class HikWebSocketClient:
         self.writer.write(ws_frame)
         await self.writer.drain()
 
+    def _dispatch_data_frame(self, opcode: int, payload: bytes) -> tuple:
+        """将完整的数据帧转换为 (msg_type, payload) 返回值"""
+        if opcode == self.WS_OP_TEXT:
+            # 服务器用 TEXT 帧发送 JSON 协议消息
+            return self.WS_OP_TEXT, payload
+
+        # BINARY: 解包协议消息，如果失败则返回原始数据（可能是视频/RTP流）
+        msg_type, msg_payload, _ = HikProtocol.unpack_message(payload)
+        if msg_type is not None:
+            return msg_type, msg_payload
+        return self.WS_OP_BINARY, payload
+
     async def receive_message(self) -> tuple:
-        """接收消息（阻塞）"""
+        """接收消息（阻塞）
+
+        返回 (msg_type, payload)；连接关闭时返回 (None, None)。
+        支持 WebSocket 分片帧（continuation）重组。
+        """
         while self.connected:
             # 先尝试从 buffer 消费
             while self.buffer:
-                opcode, payload, self.buffer = self._parse_ws_frame(self.buffer)
+                opcode, payload, remaining, is_fin = self._parse_ws_frame(self.buffer)
                 if opcode is None:
                     # buffer 中数据不完整，需要读取更多
                     break
+                self.buffer = bytearray(remaining)
 
-                if opcode == self.WS_OP_TEXT:
-                    # 服务器用 TEXT 帧发送 JSON 协议消息
-                    # 返回 (opcode, payload) 让子类处理
-                    return self.WS_OP_TEXT, payload
-
-                elif opcode == self.WS_OP_BINARY:
-                    # 解包协议消息，如果失败则返回原始数据（可能是视频/RTP流）
-                    msg_type, msg_payload, _ = HikProtocol.unpack_message(payload)
-                    if msg_type is not None:
-                        return msg_type, msg_payload
-                    else:
-                        # 原始 BINARY 数据（视频流）
-                        return self.WS_OP_BINARY, payload
-
-                elif opcode == self.WS_OP_PING:
+                if opcode == self.WS_OP_PING:
                     # 响应 PING
                     pong_frame = self._make_ws_frame(self.WS_OP_PONG, payload)
                     self.writer.write(pong_frame)
                     await self.writer.drain()
+                    continue
 
-                elif opcode == self.WS_OP_CLOSE:
+                if opcode == self.WS_OP_PONG:
+                    # 心跳应答，忽略
+                    continue
+
+                if opcode == self.WS_OP_CLOSE:
                     logger.info("Server closed connection")
                     self.connected = False
                     return None, None
 
+                if opcode == self.WS_OP_CONTINUATION:
+                    # 分片续帧
+                    if self._frag_opcode is None:
+                        logger.warning("Unexpected continuation frame, dropped")
+                        continue
+                    self._frag_buffer.extend(payload)
+                    if len(self._frag_buffer) > self.MAX_BUFFER_SIZE:
+                        logger.error("Fragmented message too large, dropping")
+                        self._frag_opcode = None
+                        self._frag_buffer = bytearray()
+                        continue
+                    if not is_fin:
+                        continue
+                    full_payload = bytes(self._frag_buffer)
+                    frag_opcode = self._frag_opcode
+                    self._frag_opcode = None
+                    self._frag_buffer = bytearray()
+                    return self._dispatch_data_frame(frag_opcode, full_payload)
+
+                # TEXT / BINARY 数据帧
+                if not is_fin:
+                    # 分片首帧，缓存等待续帧
+                    self._frag_opcode = opcode
+                    self._frag_buffer = bytearray(payload)
+                    continue
+
+                return self._dispatch_data_frame(opcode, payload)
+
+            if not self.connected:
+                break
+
             # 缓冲区数据不完整，需要读取更多
-            data = await self.reader.read(8192)
+            try:
+                if self.read_timeout:
+                    data = await asyncio.wait_for(
+                        self.reader.read(self.READ_CHUNK_SIZE),
+                        timeout=self.read_timeout
+                    )
+                else:
+                    data = await self.reader.read(self.READ_CHUNK_SIZE)
+            except asyncio.TimeoutError:
+                raise ConnectionError(
+                    f"Read timeout after {self.read_timeout}s (no data from server)")
+
             if not data:
-                raise Exception("Connection closed")
-            self.buffer += data
+                self.connected = False
+                raise ConnectionError("Connection closed by peer")
+
+            self.buffer.extend(data)
+            if len(self.buffer) > self.MAX_BUFFER_SIZE:
+                raise ConnectionError("Receive buffer overflow, closing connection")
+
+        return None, None
+
+    async def _keepalive_loop(self):
+        """周期性发送 WebSocket PING 保活"""
+        try:
+            while self.connected:
+                await asyncio.sleep(self.keepalive_interval)
+                if not self.connected or self.writer is None:
+                    break
+                try:
+                    ping_frame = self._make_ws_frame(self.WS_OP_PING, b'')
+                    self.writer.write(ping_frame)
+                    await self.writer.drain()
+                    logger.debug("Keepalive ping sent")
+                except Exception as e:
+                    logger.debug(f"Keepalive send failed: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    def start_keepalive(self):
+        """启动心跳任务（幂等）"""
+        if self.keepalive_interval and self._keepalive_task is None:
+            self._keepalive_task = asyncio.ensure_future(self._keepalive_loop())
 
 
 class HikMediaClient(HikWebSocketClient):
     """海康威视媒体流客户端"""
 
-    def __init__(self, config: HikConfig):
-        super().__init__(config)
+    def __init__(self, config: HikConfig, **kwargs):
+        super().__init__(config, **kwargs)
         self._server_pkd: str = ""
         self._server_rand: str = ""
         self._server_cipher_suite: str = "0"
-        self.on_error: Optional[Callable[[str], None]] = None
+        self._server_version: str = ""
         self._server_stream_key: str = ""
 
+    def _build_media_url(self) -> str:
+        """构建 media WebSocket URL"""
+        # media URL 格式: /media?version=0.1&cipherSuites=0&sessionID=&proxy=<device>
+        # device_ip 已经包含括号（如 [fd00:0:2c0:9::10c]），直接拼接
+        proxy = f"{self.config.device_ip}:{self.config.device_port}"
+        return f"/media?version={self.config.version}&cipherSuites={self.config.cipher_suites}&sessionID=&proxy={proxy}"
+
     async def authenticate(self) -> bool:
-        """接收服务器下发的 PKD/rand"""
+        """接收服务器下发的 PKD/rand（不需要主动发认证请求）"""
         try:
             msg_type, response = await self.receive_message()
+
+            if msg_type is None:
+                logger.error("Connection closed before authentication")
+                return False
 
             if msg_type == self.WS_OP_TEXT:
                 resp = json.loads(response.decode('utf-8'))
@@ -545,44 +683,10 @@ class HikMediaClient(HikWebSocketClient):
                 # cipherSuite 可能是数字或字符串，统一转为字符串
                 cs = resp.get('cipherSuite', resp.get('cipherSuites', '0'))
                 self._server_cipher_suite = str(cs)
-                logger.info(f"Received PKD/rand from server, cipherSuite={self._server_cipher_suite!r}")
-                return True
-
-            else:
-                logger.warning(f"Unexpected message type: 0x{msg_type:02x}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Authentication failed: {e}")
-            return False
-
-    def _build_media_url(self) -> str:
-        """构建 media WebSocket URL"""
-        # media URL 格式: /media?version=0.1&cipherSuites=0&sessionID=&proxy=<device>
-        # device_ip 已经包含括号（如 [fd00:0:2c0:9::10c]），直接拼接
-        proxy = f"{self.config.device_ip}:{self.config.device_port}"
-        return f"/media?version={self.config.version}&cipherSuites={self.config.cipher_suites}&sessionID=&proxy={proxy}"
-
-    async def authenticate(self) -> bool:
-        """接收服务器下发的 PKD/rand（不需要主动发认证请求）"""
-        try:
-            msg_type, response = await self.receive_message()
-
-            if msg_type == self.WS_OP_TEXT:
-                resp = json.loads(response.decode('utf-8'))
-
-                if resp.get('errorCode') and resp.get('errorCode') != 0:
-                    logger.error(f"Server error: {resp}")
-                    if self.on_error:
-                        self.on_error(resp.get('errorMsg', str(resp)))
-                    return False
-
-                self._server_pkd = resp.get('PKD', '')
-                self._server_rand = resp.get('rand', '')
-                self._server_cipher_suite = resp.get('cipherSuite', '0')
-                self._server_version = resp.get('version', '1.0')
-                logger.info(f"Received PKD/rand from server")
-                logger.info(f"  cipherSuite: {self._server_cipher_suite}, version: {self._server_version}")
+                self._server_version = str(resp.get('version', '1.0'))
+                logger.info(
+                    f"Received PKD/rand from server, "
+                    f"cipherSuite={self._server_cipher_suite!r}, version={self._server_version!r}")
                 return True
 
             else:
@@ -599,51 +703,64 @@ class HikMediaClient(HikWebSocketClient):
             # 构建目标 URL
             device_url = f"ws://{self.config.device_ip}:{self.config.device_port}/openUrl/{self.config.password}"
 
-            # 生成 iv 和 key（客户端固定密钥加密时间戳）
-            iv, key = HikCrypto.generate_client_iv_key()
-
-            # 生成 realplay 的 key = AES_Encrypt(iv:key, PKD)
-            realplay_key = HikCrypto.generate_realplay_key(iv, key, self._server_pkd)
-
-            # authorization = AES_Encrypt(rand:auth, key_hex, iv)
-            # auth = password (empty string for no auth)
-            authorization = HikCrypto.generate_authorization(
-                self._server_rand,
-                self.config.password,
-                key,
-                iv
-            )
-
-            # token = AES_Encrypt(SHA256(url), key_hex, iv)
-            token = HikCrypto.generate_token(
-                hashlib.sha256(device_url.encode()).hexdigest(),
-                key,
-                iv
-            )
-
-            # 构建 realplay 请求 - 服务器返回 key 后不需要额外加密
+            # 构建 realplay 请求 - 空 key/authorization/token 会触发服务器直接返回视频流
+            # 注: 若服务器要求加密字段，可用 HikCrypto.generate_client_iv_key /
+            #     generate_realplay_key / generate_authorization / generate_token 生成
             realplay_data = {
                 "sequence": 0,
                 "cmd": "realplay",
                 "url": device_url,
-                "key": "",  # 空 key 会触发服务器返回视频流
+                "key": "",
                 "authorization": "",
                 "token": ""
             }
 
             logger.info(f"Sending realplay: {device_url}")
-            logger.debug(f"  iv={iv[:32]}, key={key[:32]}")
-            logger.debug(f"  realplay_key={realplay_key[:32]}...")
-            logger.debug(f"  authorization={authorization[:32]}...")
             await self.send_text(json.dumps(realplay_data))
             logger.info("realplay request sent")
             return True
 
         except Exception as e:
-            logger.error(f"realplay failed: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"realplay failed: {e}")
             return False
+
+    # 常见错误码说明
+    ERROR_MESSAGES = {
+        0: "成功",
+        28316423: "URL已过期，请获取新的有效URL",
+        65559: "认证失败，请检查密码或权限",
+        16777237: "RSA加密失败，请检查密钥生成逻辑",
+    }
+
+    def _safe_callback(self, cb, *args):
+        """执行回调并隔离用户回调中的异常，避免影响主循环"""
+        if cb is None:
+            return
+        try:
+            cb(*args)
+        except Exception as e:
+            logger.warning(f"Callback error: {e}")
+
+    def _handle_text_message(self, payload: bytes):
+        """处理服务器 TEXT JSON 响应"""
+        try:
+            resp = json.loads(payload.decode('utf-8', errors='replace'))
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Malformed TEXT message ({e}), ignored: {payload[:100]!r}")
+            return
+
+        error_code = resp.get('errorCode', 0)
+
+        if error_code == 0 and resp.get('sdp'):
+            logger.info("realplay success, received SDP")
+            logger.debug(f"SDP: {resp['sdp'][:100]}...")
+        elif error_code != 0:
+            friendly_msg = self.ERROR_MESSAGES.get(
+                error_code, f"未知错误 (errorCode: {error_code})")
+            logger.error(f"realplay failed: {friendly_msg}")
+            if error_code == 28316423:
+                logger.error("提示: URL可能已过期，请从设备重新获取新的播放链接")
+            self._safe_callback(self.on_error, friendly_msg)
 
     async def run(self):
         """运行客户端主循环"""
@@ -671,68 +788,95 @@ class HikMediaClient(HikWebSocketClient):
         if not await self.realplay():
             return False
 
+        # 启动应用层心跳保活
+        self.start_keepalive()
+
         # 处理响应和数据
         video_count = 0
-        while self.connected:
-            msg_type, payload = await self.receive_message()
+        video_bytes = 0
+        last_stat_time = time.monotonic()
+        try:
+            while self.connected:
+                msg_type, payload = await self.receive_message()
 
-            if msg_type is None:
-                break
+                if msg_type is None:
+                    break
 
-            if msg_type == self.WS_OP_TEXT:
-                # 服务器 TEXT JSON 响应
-                resp = json.loads(payload.decode('utf-8'))
-                error_code = resp.get('errorCode', 0)
-                
-                # 常见错误码说明
-                error_messages = {
-                    0: "成功",
-                    28316423: "URL已过期，请获取新的有效URL",
-                    65559: "认证失败，请检查密码或权限",
-                    16777237: "RSA加密失败，请检查密钥生成逻辑",
-                }
-                
-                if error_code == 0 and resp.get('sdp'):
-                    logger.info("realplay success, received SDP")
-                    logger.debug(f"SDP: {resp['sdp'][:100]}...")
-                elif error_code != 0:
-                    error_msg = resp.get('errorMsg', '')
-                    friendly_msg = error_messages.get(error_code, f"未知错误 (errorCode: {error_code})")
-                    logger.error(f"realplay failed: {friendly_msg}")
-                    if error_code == 28316423:
-                        logger.error("提示: URL可能已过期，请从设备重新获取新的播放链接")
-                    if self.on_error:
-                        self.on_error(friendly_msg)
+                if msg_type == self.WS_OP_TEXT:
+                    self._handle_text_message(payload)
 
-            elif msg_type == self.WS_OP_BINARY:
-                # 原始 BINARY 数据（视频流）
-                video_count += 1
-                logger.info(f"Video data: {len(payload)} bytes (frame #{video_count})")
-                if self.on_video_data:
-                    self.on_video_data(payload)
+                elif msg_type in (self.WS_OP_BINARY, HikProtocol.MSG_TYPE_VIDEO_DATA):
+                    # 原始 BINARY 数据 / 协议视频数据
+                    video_count += 1
+                    video_bytes += len(payload)
+                    # 高频路径：统计信息按秒聚合输出，避免逐帧打日志拖慢吞吐
+                    now = time.monotonic()
+                    if now - last_stat_time >= 1.0:
+                        logger.info(
+                            f"Video stream: {video_count} frames, "
+                            f"{video_bytes / 1024:.1f} KB total, last frame {len(payload)} bytes")
+                        last_stat_time = now
+                    self._safe_callback(self.on_video_data, payload)
 
-            elif msg_type == HikProtocol.MSG_TYPE_VIDEO_DATA:
-                video_count += 1
-                logger.info(f"Video data: {len(payload)} bytes (total: {video_count} frames)")
-                if self.on_video_data:
-                    self.on_video_data(payload)
+                elif msg_type == HikProtocol.MSG_TYPE_AUDIO_DATA:
+                    self._safe_callback(self.on_audio_data, payload)
 
-            elif msg_type == HikProtocol.MSG_TYPE_AUDIO_DATA:
-                if self.on_audio_data:
-                    self.on_audio_data(payload)
+                elif msg_type == HikProtocol.MSG_TYPE_KEEPALIVE:
+                    logger.debug("Keepalive received")
 
-            elif msg_type == HikProtocol.MSG_TYPE_KEEPALIVE:
-                logger.debug("Keepalive received")
+                elif msg_type == HikProtocol.MSG_TYPE_SESSION_ERROR:
+                    error = payload.decode('utf-8', errors='replace')
+                    logger.error(f"Session error: {error}")
+                    self._safe_callback(self.on_error, error)
+                    break
 
-            elif msg_type == HikProtocol.MSG_TYPE_SESSION_ERROR:
-                error = payload.decode('utf-8')
-                logger.error(f"Session error: {error}")
-                if self.on_error:
-                    self.on_error(error)
-                break
+        except (ConnectionError, asyncio.IncompleteReadError, OSError) as e:
+            logger.error(f"Connection error: {e}")
+            self._safe_callback(self.on_error, str(e))
+        finally:
+            if self._keepalive_task is not None:
+                self._keepalive_task.cancel()
+                self._keepalive_task = None
 
-        logger.info(f"Stream ended. Total video frames: {video_count}")
+        logger.info(f"Stream ended. Total video frames: {video_count} ({video_bytes} bytes)")
         return True
+
+    async def run_forever(self, max_retries: int = 0,
+                          initial_backoff: float = 1.0,
+                          max_backoff: float = 30.0):
+        """带自动重连的主循环
+
+        Args:
+            max_retries: 最大连续重连次数，0 表示无限重连
+            initial_backoff: 初始退避秒数（指数递增）
+            max_backoff: 最大退避秒数
+        """
+        retries = 0
+        backoff = initial_backoff
+        while True:
+            start = time.monotonic()
+            try:
+                await self.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Client crashed: {e}")
+            finally:
+                await self.close()
+
+            # 会话若稳定运行超过 30 秒，则重置退避计数
+            if time.monotonic() - start > 30:
+                retries = 0
+                backoff = initial_backoff
+
+            retries += 1
+            if max_retries and retries > max_retries:
+                logger.error(f"Give up after {max_retries} retries")
+                break
+
+            logger.info(f"Reconnecting in {backoff:.1f}s (attempt {retries})...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
 
 
 def parse_proxy_url(url: str) -> HikConfig:
@@ -762,36 +906,46 @@ def parse_proxy_url(url: str) -> HikConfig:
     # 或者: ['proxy', '<device_ip>:<device_port>']  (没有 openUrl/auth)
 
     device_info = path_parts[1] if len(path_parts) > 1 else ""
+    if not device_info:
+        raise ValueError(f"Invalid proxy URL, missing device info: {url}")
 
     # 分离 IP 和端口
-    if ':' in device_info:
-        # 检查是否是 IPv6
-        if device_info.startswith('['):
-            # IPv6 格式: [ip]:port
-            parts = device_info[1:].split(']:')
-            device_ip = '[' + parts[0] + ']'
-            device_port = int(parts[1])
+    try:
+        if ':' in device_info:
+            # 检查是否是 IPv6
+            if device_info.startswith('['):
+                # IPv6 格式: [ip]:port
+                if ']:' in device_info:
+                    ip_part, port_part = device_info[1:].split(']:', 1)
+                    device_ip = '[' + ip_part + ']'
+                    device_port = int(port_part)
+                else:
+                    # 纯 [ipv6] 无端口
+                    device_ip = device_info
+                    device_port = 554
+            else:
+                ip_part, port_part = device_info.rsplit(':', 1)
+                device_ip = ip_part
+                device_port = int(port_part)
         else:
-            parts = device_info.rsplit(':', 1)
-            device_ip = parts[0]
-            device_port = int(parts[1])
-    else:
-        device_ip = device_info
-        device_port = 554  # 默认 RTSP 端口
+            device_ip = device_info
+            device_port = 554  # 默认 RTSP 端口
+    except ValueError as e:
+        raise ValueError(f"Invalid device address in URL: {device_info!r}") from e
 
     # 获取认证信息（如果有）
     username = "admin"
     password = ""
     if len(path_parts) > 3 and path_parts[2] == 'openUrl':
         auth = path_parts[3]
-        # auth 可能是 base64 或明文
+        # auth 可能是 base64 或明文（严格校验 base64，避免明文被误解码成乱码）
         try:
-            decoded = base64.b64decode(auth.encode()).decode()
+            decoded = base64.b64decode(auth.encode(), validate=True).decode('utf-8')
             if ':' in decoded:
                 username, password = decoded.split(':', 1)
             else:
                 password = decoded
-        except:
+        except Exception:
             password = auth
 
     return HikConfig(
@@ -805,18 +959,21 @@ def parse_proxy_url(url: str) -> HikConfig:
     )
 
 
-async def demo_callback(video_data: bytes):
-    """视频数据回调示例"""
-    logger.info(f"Received video data: {len(video_data)} bytes")
+def demo_callback(video_data: bytes):
+    """视频数据回调示例（同步函数，回调在事件循环中直接调用）"""
+    logger.debug(f"Received video data: {len(video_data)} bytes")
 
 
 async def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='Hikvision WebSocket Client')
     parser.add_argument('url', help='Hikvision proxy URL (wss://...)')
-    parser.add_argument('-u', '--username', default='admin', help='Username')
-    parser.add_argument('-p', '--password', default='', help='Password')
+    parser.add_argument('-u', '--username', default=None, help='Username (overrides URL)')
+    parser.add_argument('-p', '--password', default=None, help='Password (overrides URL)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('--reconnect', action='store_true', help='Auto reconnect on failure')
+    parser.add_argument('--max-retries', type=int, default=0,
+                        help='Max reconnect attempts (0 = unlimited)')
 
     args = parser.parse_args()
 
@@ -826,10 +983,10 @@ async def main():
     # 解析 URL
     config = parse_proxy_url(args.url)
 
-    # 覆盖用户名密码
-    if args.username:
+    # 只有命令行显式提供时才覆盖 URL 中解析出的用户名密码
+    if args.username is not None:
         config.username = args.username
-    if args.password:
+    if args.password is not None:
         config.password = args.password
 
     logger.info(f"Parsed configuration:")
@@ -846,7 +1003,10 @@ async def main():
 
     # 运行客户端
     try:
-        await client.run()
+        if args.reconnect:
+            await client.run_forever(max_retries=args.max_retries)
+        else:
+            await client.run()
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:

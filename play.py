@@ -34,73 +34,94 @@ logger = logging.getLogger(__name__)
 latest_frame = None
 is_running = True
 
-def ffmpeg_decoder_thread(stdin_queue, ffmpeg_proc):
+MAX_DECODE_BUFFER = 32 * 1024 * 1024  # 解码缓冲上限，防止内存无限增长
+
+
+def ffmpeg_decoder_thread(ffmpeg_proc):
     """
     负责从 stdout 读取 FFMPEG 解码出的 MJPEG 流并提取为独立的 JPEG 帧
     """
     global latest_frame, is_running
     bytes_data = b''
-    
+
     while is_running:
         try:
-            chunk = ffmpeg_proc.stdout.read(4096)
+            chunk = ffmpeg_proc.stdout.read(65536)
             if not chunk:
                 break
             bytes_data += chunk
-            
+
             # 查找 JPEG 图片的 SOI (FF D8) 和 EOI (FF D9)
             while True:
                 start_idx = bytes_data.find(b'\xff\xd8')
-                end_idx = bytes_data.find(b'\xff\xd9')
-                
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    # 提取出一张完整的 JPG
-                    jpg_data = bytes_data[start_idx:end_idx+2]
-                    bytes_data = bytes_data[end_idx+2:]
-                    
-                    # 使用 CV2 解码 JPEG
-                    frame = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if frame is not None:
-                        latest_frame = frame
-                else:
+                if start_idx == -1:
+                    # 无 SOI，丢弃无效数据（保留最后 1 字节防止标记被截断）
+                    bytes_data = bytes_data[-1:]
                     break
+                # 丢弃 SOI 之前的残留数据，并且 EOI 只在 SOI 之后搜索
+                if start_idx > 0:
+                    bytes_data = bytes_data[start_idx:]
+                end_idx = bytes_data.find(b'\xff\xd9', 2)
+                if end_idx == -1:
+                    break
+                # 提取出一张完整的 JPG
+                jpg_data = bytes_data[:end_idx + 2]
+                bytes_data = bytes_data[end_idx + 2:]
+
+                # 使用 CV2 解码 JPEG
+                frame = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    latest_frame = frame
+
+            # 缓冲上限保护
+            if len(bytes_data) > MAX_DECODE_BUFFER:
+                logger.warning("Decode buffer overflow, resetting")
+                bytes_data = b''
         except Exception as e:
-            logger.error(f"Error reading ffmpeg output: {e}")
+            if is_running:
+                logger.error(f"Error reading ffmpeg output: {e}")
             break
+
 
 def ffmpeg_writer_thread(video_queue, ffmpeg_proc):
     """
-    负责将 Web socket 收到的二进制数据流写入 FFMPEG 的 stdin
+    负责将 WebSocket 收到的二进制数据流写入 FFMPEG 的 stdin
     """
     global is_running
+    import queue as _queue
     while is_running:
         try:
             # 阻塞等待数据
             item = video_queue.get(timeout=1.0)
-            if item is None: # 结束信号
-                break
+        except _queue.Empty:
+            continue
+        if item is None:  # 结束信号
+            break
+        try:
             ffmpeg_proc.stdin.write(item)
             ffmpeg_proc.stdin.flush()
-        except Exception:
-            pass
+        except (BrokenPipeError, OSError, ValueError) as e:
+            if is_running:
+                logger.error(f"ffmpeg stdin write failed (ffmpeg exited?): {e}")
+            break
 
 async def main():
     global latest_frame, is_running
     parser = argparse.ArgumentParser(description='Hikvision WebSocket Player & Saver')
     parser.add_argument('url', help='Full Hikvision proxy URL')
-    parser.add_argument('-u', '--username', default='admin', help='Username')
-    parser.add_argument('-p', '--password', default='', help='Password')
+    parser.add_argument('-u', '--username', default=None, help='Username (overrides URL)')
+    parser.add_argument('-p', '--password', default=None, help='Password (overrides URL)')
     parser.add_argument('--output-dir', default='./output', help='Screenshot output directory')
     
     args = parser.parse_args()
     
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     config = parse_proxy_url(args.url)
-    if args.username != 'admin':
+    if args.username is not None:
         config.username = args.username
-    if args.password:
+    if args.password is not None:
         config.password = args.password
         
     logger.info(f"Connecting to device via {config.proxy_host}...")
@@ -131,7 +152,7 @@ async def main():
     video_queue = queue.Queue(maxsize=100)
     
     # 收发线程
-    reader_th = threading.Thread(target=ffmpeg_decoder_thread, args=(video_queue, ffmpeg_proc))
+    reader_th = threading.Thread(target=ffmpeg_decoder_thread, args=(ffmpeg_proc,))
     writer_th = threading.Thread(target=ffmpeg_writer_thread, args=(video_queue, ffmpeg_proc))
     reader_th.daemon = True
     writer_th.daemon = True
@@ -139,13 +160,18 @@ async def main():
     writer_th.start()
 
     client = HikMediaClient(config)
+    dropped_frames = [0]
+
     def on_video(data):
         try:
             # 放入队列供 ffmpeg_writer 消费
             video_queue.put_nowait(data)
         except queue.Full:
-            pass
-            
+            # 队列满则丢帧（解码跟不上），周期性告警而非静默丢弃
+            dropped_frames[0] += 1
+            if dropped_frames[0] % 100 == 1:
+                logger.warning(f"解码队列已满，累计丢帧 {dropped_frames[0]}")
+
     client.on_video_data = on_video
 
     # 将运行放在后台 task 中，保证主线程用来展示 CV2 的 imshow
@@ -181,18 +207,28 @@ async def main():
     finally:
         logger.info("正在退出...")
         is_running = False
-        video_queue.put(None)
+        try:
+            video_queue.put_nowait(None)
+        except queue.Full:
+            pass
         await client.close()
         task.cancel()
-        
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
         if ffmpeg_proc:
             try:
                 ffmpeg_proc.stdin.close()
                 ffmpeg_proc.terminate()
                 ffmpeg_proc.wait(timeout=2)
-            except:
-                pass
-                
+            except Exception:
+                try:
+                    ffmpeg_proc.kill()
+                except Exception:
+                    pass
+
         cv2.destroyAllWindows()
 
 if __name__ == '__main__':

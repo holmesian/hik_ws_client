@@ -1,0 +1,42 @@
+# 云原生开发环境 + 镜像构建流水线
+
+$:
+  vscode:
+    - runner:
+        cpus: 8
+      docker:
+        image: ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}:latest
+      env:
+        CNB_WELCOME_EXECUTE_COMMAND: echo "Welcome to ${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE} !"; git config pull.rebase true
+      services:
+        - name: vscode
+          options:
+            # 保活时间：17 小时无心跳才关闭开发环境
+            keepAliveTimeout: 17h
+        - docker
+      stages:
+        - name: install tools
+          jobs:
+            init daemon:
+              script: curl -fsSL https://www.codebuddy.cn/cli/install.sh | bash  && curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash &&  git config pull.rebase true
+        - name: init dev
+          jobs:
+            show workspace:
+              script: ls -l
+
+# .cnb 目录变更时自动重新构建并推送开发镜像
+main:
+  push:
+    - name: build-dev-image
+      docker:
+        image: cnbcool/default-build-env:latest
+      services:
+        - docker
+      ifModify:
+        - .cnb/**
+        - requirements.txt
+        - go-client/go.mod
+        - go-client/go.sum
+      stages:
+        - name: build and push dev image
+          script: bash .cnb/build-push-cnb-dev.sh latest
