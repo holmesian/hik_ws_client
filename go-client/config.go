@@ -19,6 +19,10 @@ type HikConfig struct {
 	Password     string
 	Version      string
 	CipherSuites int
+	// Verbose enables per-frame debug logging. Leave false in production:
+	// every video/audio frame would otherwise emit a log line, which
+	// dominates I/O and allocates under multi-stream concurrency.
+	Verbose bool
 }
 
 // ParseProxyURL parses a Hikvision proxy URL to extract the configuration.

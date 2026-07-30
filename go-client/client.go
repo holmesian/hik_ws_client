@@ -128,10 +128,14 @@ func (c *HikMediaClient) Realplay() error {
 
 // Run processes incoming messages until context is cancelled or connection drops.
 // This matches the Python client's receive_message + run loop behavior:
-//   - Each binary WebSocket frame is unpacked ONCE (no cross-frame buffering).
+//   - Each binary WebSocket frame is unpacked and ALL protocol messages it
+//     carries are dispatched (the server may batch several into one frame);
+//     previously only the first was handled and the rest were dropped.
 //   - If unpack succeeds with a known type → handle by type.
 //   - If unpack succeeds with an unknown type → discard (matches Python).
-//   - If unpack fails → treat entire frame payload as raw video (matches Python).
+//   - If unpack fails → treat the rest of the frame as raw video (matches Python).
+// Per-frame logging is gated behind Config.Verbose to avoid log/alloc storms
+// under multi-stream concurrency.
 func (c *HikMediaClient) Run(ctx context.Context) {
 	// Close the underlying connection when context is cancelled so that
 	// ReadMessage unblocks immediately (the select+default pattern alone
@@ -198,21 +202,29 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 			}
 
 		} else if msgType == websocket.BinaryMessage {
-			// ---- Match Python receive_message behaviour ----
-			// Try to unpack HikProtocol header once; if it fails,
-			// treat the whole WebSocket payload as raw video.
-			pType, pData, _, unpackErr := UnpackMessage(payload)
-
-			if unpackErr != nil {
-				// Unpack failed → raw video data (matches Python WS_OP_BINARY path)
-				log.Printf("Raw video frame: %d bytes", len(payload))
-				if c.OnVideoData != nil {
-					c.OnVideoData(payload)
+			// ---- Match Python receive_message behaviour, but dispatch every
+			// protocol message carried in this frame ----
+			// Unpack until the frame is exhausted; a failed unpack means the
+			// remaining bytes are raw video (matches Python WS_OP_BINARY path).
+			buf := payload
+			for len(buf) > 0 {
+				pType, pData, remaining, unpackErr := UnpackMessage(buf)
+				if unpackErr != nil {
+					// Header incomplete / payload truncated → raw video data.
+					if c.Config.Verbose {
+						log.Printf("Raw video frame: %d bytes", len(buf))
+					}
+					if c.OnVideoData != nil {
+						c.OnVideoData(buf)
+					}
+					break
 				}
-			} else {
+
 				switch pType {
 				case MsgTypeVideoData:
-					log.Printf("Protocol video frame: %d bytes", len(pData))
+					if c.Config.Verbose {
+						log.Printf("Protocol video frame: %d bytes", len(pData))
+					}
 					if c.OnVideoData != nil {
 						c.OnVideoData(pData)
 					}
@@ -231,8 +243,12 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					// Unknown protocol type (e.g. 0x00 stream metadata) —
 					// discard, matching Python which has no handler for
 					// unmatched msg_types.
-					log.Printf("Protocol msg 0x%02x: %d bytes (discarded)", pType, len(pData))
+					if c.Config.Verbose {
+						log.Printf("Protocol msg 0x%02x: %d bytes (discarded)", pType, len(pData))
+					}
 				}
+
+				buf = remaining
 			}
 		}
 	}
