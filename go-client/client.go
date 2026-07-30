@@ -15,7 +15,8 @@ import (
 
 // keepaliveInterval is how often a WebSocket ping is sent to keep the
 // session alive; keepaliveWriteWait bounds each control-frame write.
-const (
+// They are vars so tests can shorten them.
+var (
 	keepaliveInterval  = 20 * time.Second
 	keepaliveWriteWait = 5 * time.Second
 )
@@ -134,6 +135,51 @@ func (c *HikMediaClient) Realplay() error {
 	return c.conn.WriteMessage(websocket.TextMessage, reqBytes)
 }
 
+// deliverVideo recovers the per-frame metadata and hands the payload to the
+// caller. Protocol-framed video (0x40) and raw binary frames both go through
+// here, so a caller that only registers OnVideoFrame receives every frame —
+// previously the raw path only fired OnVideoData and silently dropped frames
+// for OnVideoFrame-only consumers.
+//
+// OnVideoFrame takes precedence over OnVideoData to avoid delivering the same
+// payload twice; OnVideoData alone keeps working for existing callers.
+func (c *HikMediaClient) deliverVideo(data []byte) {
+	if c.OnVideoFrame == nil && c.OnVideoData == nil {
+		return
+	}
+	if c.startTime.IsZero() {
+		c.startTime = time.Now()
+	}
+	c.frameCount++
+
+	codec := ""
+	if c.mediaInfo != nil {
+		codec = c.mediaInfo.Codec
+	}
+	elapsed := time.Since(c.startTime)
+	meta := &FrameMeta{
+		FrameIndex:  c.frameCount,
+		IsKeyFrame:  AnalyzeFrame(data, codec),
+		Codec:       codec,
+		TimestampMs: elapsed.Milliseconds(),
+	}
+	if c.mediaInfo != nil {
+		meta.Width, meta.Height = c.mediaInfo.Width, c.mediaInfo.Height
+		if c.mediaInfo.ClockRate > 0 {
+			meta.PTS = int64(elapsed.Seconds() * float64(c.mediaInfo.ClockRate))
+		}
+	}
+	if c.Config.Verbose {
+		log.Printf("Video frame #%d: %d bytes (key=%v, codec=%s)", meta.FrameIndex, len(data), meta.IsKeyFrame, codec)
+	}
+
+	if c.OnVideoFrame != nil {
+		c.OnVideoFrame(meta, data)
+		return
+	}
+	c.OnVideoData(data)
+}
+
 // Run processes incoming messages until context is cancelled or connection drops.
 // This matches the Python client's receive_message + run loop behavior:
 //   - Each binary WebSocket frame is unpacked and ALL protocol messages it
@@ -142,6 +188,7 @@ func (c *HikMediaClient) Realplay() error {
 //   - If unpack succeeds with a known type → handle by type.
 //   - If unpack succeeds with an unknown type → discard (matches Python).
 //   - If unpack fails → treat the rest of the frame as raw video (matches Python).
+//
 // Per-frame logging is gated behind Config.Verbose to avoid log/alloc storms
 // under multi-stream concurrency.
 func (c *HikMediaClient) Run(ctx context.Context) {
@@ -204,17 +251,17 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					if c.OnError != nil {
 						c.OnError(fmt.Errorf("%s", errMsg))
 					}
-			} else if sdp, ok := resp["sdp"].(string); ok && sdp != "" {
-				if c.Config.Verbose {
-					log.Printf("realplay OK, SDP length=%d", len(sdp))
+				} else if sdp, ok := resp["sdp"].(string); ok && sdp != "" {
+					if c.Config.Verbose {
+						log.Printf("realplay OK, SDP length=%d", len(sdp))
+					}
+					// Recover the SDP-like stream description and expose it to
+					// callers (codec, clock rate, width/height from SPS).
+					c.mediaInfo = ParseSDP(sdp)
+					if c.OnMediaInfo != nil {
+						c.OnMediaInfo(c.mediaInfo)
+					}
 				}
-				// Recover the SDP-like stream description and expose it to
-				// callers (codec, clock rate, width/height from SPS).
-				c.mediaInfo = ParseSDP(sdp)
-				if c.OnMediaInfo != nil {
-					c.OnMediaInfo(c.mediaInfo)
-				}
-			}
 			}
 
 		} else if msgType == websocket.BinaryMessage {
@@ -230,49 +277,14 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					if c.Config.Verbose {
 						log.Printf("Raw video frame: %d bytes", len(buf))
 					}
-					if c.OnVideoData != nil {
-						c.OnVideoData(buf)
-					}
+					c.deliverVideo(buf)
 					break
 				}
 
 				pType, pData := msg.Type, msg.Payload
 				switch pType {
 				case MsgTypeVideoData:
-					if c.startTime.IsZero() {
-						c.startTime = time.Now()
-					}
-					c.frameCount++
-					codec := ""
-					if c.mediaInfo != nil {
-						codec = c.mediaInfo.Codec
-					}
-					isKey := AnalyzeFrame(pData, codec)
-					elapsed := time.Since(c.startTime)
-					meta := &FrameMeta{
-						FrameIndex:  c.frameCount,
-						IsKeyFrame:  isKey,
-						Codec:       codec,
-						TimestampMs: elapsed.Milliseconds(),
-					}
-					if c.mediaInfo != nil {
-						meta.Width, meta.Height = c.mediaInfo.Width, c.mediaInfo.Height
-						if c.mediaInfo.ClockRate > 0 {
-							meta.PTS = int64(elapsed.Seconds() * float64(c.mediaInfo.ClockRate))
-						}
-					}
-					if c.Config.Verbose {
-						log.Printf("Protocol video frame: %d bytes (key=%v, codec=%s)", len(pData), isKey, codec)
-					}
-					// OnVideoFrame gives metadata + payload; when it is set
-					// we use it instead of OnVideoData to avoid delivering
-					// the same payload twice. OnVideoData still fires for
-					// callers that only register the raw-payload callback.
-					if c.OnVideoFrame != nil {
-						c.OnVideoFrame(meta, pData)
-					} else if c.OnVideoData != nil {
-						c.OnVideoData(pData)
-					}
+					c.deliverVideo(pData)
 				case MsgTypeAudioData:
 					if c.OnAudioData != nil {
 						c.OnAudioData(pData)

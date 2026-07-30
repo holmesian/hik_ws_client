@@ -17,7 +17,8 @@ import (
 // into an MJPEG pipe, then periodically saves JPEG frames to disk.
 //
 // Matches the Python play.py approach:
-//   ffmpeg -hide_banner -sn -an -i pipe:0 -f image2pipe -vcodec mjpeg -v error pipe:1
+//
+//	ffmpeg -hide_banner -sn -an -i pipe:0 -f image2pipe -vcodec mjpeg -v error pipe:1
 type VideoSaver struct {
 	pipeWriter *io.PipeWriter
 	cmd        *exec.Cmd
