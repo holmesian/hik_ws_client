@@ -28,10 +28,18 @@ type HikMediaClient struct {
 	serverPKD  string
 	serverRand string
 
+	// mediaInfo is recovered from the SDP the server returns on realplay.
+	mediaInfo *MediaInfo
+	// frameCount / startTime drive the synthetic per-frame timestamp.
+	frameCount int
+	startTime  time.Time
+
 	// Callbacks
-	OnVideoData func([]byte)
-	OnAudioData func([]byte)
-	OnError     func(error)
+	OnVideoData  func([]byte)             // raw frame payload (backward compatible)
+	OnAudioData  func([]byte)             // raw audio payload
+	OnError      func(error)              // transport / session errors
+	OnMediaInfo  func(*MediaInfo)         // SDP-like stream description (realplay)
+	OnVideoFrame func(*FrameMeta, []byte) // per-frame metadata + payload
 
 	mu sync.Mutex
 }
@@ -196,9 +204,17 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					if c.OnError != nil {
 						c.OnError(fmt.Errorf("%s", errMsg))
 					}
-				} else if sdp, ok := resp["sdp"].(string); ok && sdp != "" {
+			} else if sdp, ok := resp["sdp"].(string); ok && sdp != "" {
+				if c.Config.Verbose {
 					log.Printf("realplay OK, SDP length=%d", len(sdp))
 				}
+				// Recover the SDP-like stream description and expose it to
+				// callers (codec, clock rate, width/height from SPS).
+				c.mediaInfo = ParseSDP(sdp)
+				if c.OnMediaInfo != nil {
+					c.OnMediaInfo(c.mediaInfo)
+				}
+			}
 			}
 
 		} else if msgType == websocket.BinaryMessage {
@@ -208,7 +224,7 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 			// remaining bytes are raw video (matches Python WS_OP_BINARY path).
 			buf := payload
 			for len(buf) > 0 {
-				pType, pData, remaining, unpackErr := UnpackMessage(buf)
+				msg, unpackErr := Unpack(buf)
 				if unpackErr != nil {
 					// Header incomplete / payload truncated → raw video data.
 					if c.Config.Verbose {
@@ -220,12 +236,41 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					break
 				}
 
+				pType, pData := msg.Type, msg.Payload
 				switch pType {
 				case MsgTypeVideoData:
-					if c.Config.Verbose {
-						log.Printf("Protocol video frame: %d bytes", len(pData))
+					if c.startTime.IsZero() {
+						c.startTime = time.Now()
 					}
-					if c.OnVideoData != nil {
+					c.frameCount++
+					codec := ""
+					if c.mediaInfo != nil {
+						codec = c.mediaInfo.Codec
+					}
+					isKey := AnalyzeFrame(pData, codec)
+					elapsed := time.Since(c.startTime)
+					meta := &FrameMeta{
+						FrameIndex:  c.frameCount,
+						IsKeyFrame:  isKey,
+						Codec:       codec,
+						TimestampMs: elapsed.Milliseconds(),
+					}
+					if c.mediaInfo != nil {
+						meta.Width, meta.Height = c.mediaInfo.Width, c.mediaInfo.Height
+						if c.mediaInfo.ClockRate > 0 {
+							meta.PTS = int64(elapsed.Seconds() * float64(c.mediaInfo.ClockRate))
+						}
+					}
+					if c.Config.Verbose {
+						log.Printf("Protocol video frame: %d bytes (key=%v, codec=%s)", len(pData), isKey, codec)
+					}
+					// OnVideoFrame gives metadata + payload; when it is set
+					// we use it instead of OnVideoData to avoid delivering
+					// the same payload twice. OnVideoData still fires for
+					// callers that only register the raw-payload callback.
+					if c.OnVideoFrame != nil {
+						c.OnVideoFrame(meta, pData)
+					} else if c.OnVideoData != nil {
 						c.OnVideoData(pData)
 					}
 				case MsgTypeAudioData:
@@ -248,7 +293,7 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					}
 				}
 
-				buf = remaining
+				buf = msg.Remaining
 			}
 		}
 	}

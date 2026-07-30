@@ -52,11 +52,21 @@ func fetchStream(ctx context.Context, proxyURL string, streamID string, saveScre
 
 	videoFrames := 0
 	videoBytes := 0
-	client.OnVideoData = func(data []byte) {
+	// OnMediaInfo exposes the SDP-like stream description (codec, clock
+	// rate, recovered width/height) as soon as realplay succeeds.
+	client.OnMediaInfo = func(info *hikws.MediaInfo) {
+		log.Printf("Stream %s: media info: codec=%s clock=%d %dx%d (paramsets=%d)",
+			streamID, info.Codec, info.ClockRate, info.Width, info.Height, len(info.ParameterSets))
+	}
+	// OnVideoFrame delivers per-frame metadata (keyframe flag, codec,
+	// timestamp) alongside the payload, without re-parsing the bitstream.
+	client.OnVideoFrame = func(meta *hikws.FrameMeta, data []byte) {
 		videoFrames++
 		videoBytes += len(data)
 		if videoFrames <= 5 {
-			log.Printf("Stream %s: video frame #%d: %d bytes\n", streamID, videoFrames, len(data))
+			log.Printf("Stream %s: frame #%d: %d bytes key=%v codec=%s %dx%d pts=%d",
+				streamID, meta.FrameIndex, len(data), meta.IsKeyFrame, meta.Codec,
+				meta.Width, meta.Height, meta.PTS)
 		} else if videoFrames == 6 {
 			log.Printf("Stream %s: ... (suppressing further logs)\n", streamID)
 		}
@@ -64,6 +74,8 @@ func fetchStream(ctx context.Context, proxyURL string, streamID string, saveScre
 			_, _ = saver.Write(data)
 		}
 	}
+	// OnVideoData remains available for raw-payload consumers; when
+	// OnVideoFrame is set it is not called to avoid double delivery.
 
 	client.OnError = func(e error) {
 		log.Printf("Stream %s: Runtime error: %v\n", streamID, e)
