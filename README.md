@@ -51,6 +51,7 @@ python3 -m unittest test_hik_media
 | [docs/media-pipeline.md](./docs/media-pipeline.md) | 媒体管线：RTP 判定与剥离 → PS 解复用 → 访问单元 → 元信息恢复 |
 | [docs/python-api.md](./docs/python-api.md) | Python 客户端用法与回调 |
 | [go-client/README.md](./go-client/README.md) | Go 客户端 API、健壮性与并发选项 |
+| [go-client/e2e/bench/README.md](./go-client/e2e/bench/README.md) | 多路并发压测与内存复用优化实测：并发梯度、单路资源基线、上限判据 |
 | [samples/README.md](./samples/README.md) | 真机采集样本与全量摸底实测结论（证据都在这里） |
 | [.codebuddy/skills/hik-stream-debug/](./.codebuddy/skills/hik-stream-debug/SKILL.md) | 测试与调试方法：给一条链接或一份 OA curl 就能跑 |
 | [.codebuddy/adr/INDEX.md](./.codebuddy/adr/INDEX.md) | 架构决策记录 |
@@ -64,7 +65,7 @@ hik_ws_client/
 ├── hik_media.py         # Python 媒体解析层（仅标准库）
 ├── test_hik_media.py    # Python 回归测试 + 样本回放
 ├── demo.py / play.py    # 演示程序 / FFmpeg + OpenCV 实时播放
-├── go-client/           # Go 实现（生产路径），含 e2e/probe 实链路探针
+├── go-client/           # Go 实现（生产路径），含 e2e/probe 单路探针与 e2e/bench 并发压测
 ├── samples/             # 真机 MPEG-PS 采集（Git LFS）与实测结论
 ├── docs/                # 技术细节文档
 └── .codebuddy/          # 规范、架构决策、调试 skill
