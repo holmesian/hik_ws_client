@@ -1,6 +1,7 @@
 package hikws
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -174,6 +175,17 @@ func (c *HikMediaClient) Realplay() error {
 	c.conn.SetWriteDeadline(time.Now().Add(keepaliveWriteWait))
 	defer c.conn.SetWriteDeadline(time.Time{})
 	return c.conn.WriteMessage(websocket.TextMessage, reqBytes)
+}
+
+// clone copies a slice of the session read buffer, which the next read
+// overwrites. Every payload leaving the read loop must be copied: with
+// AsyncDelivery the delivery worker still holds it after the read loop has
+// moved on, and callers of OnRawVideo / OnVideoData are entitled to keep the
+// bytes they are handed.
+func clone(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
 }
 
 // streamEvent is one unit of work handed from the socket read loop to the
@@ -487,6 +499,16 @@ func (c *HikMediaClient) run(ctx context.Context) error {
 		}
 	}()
 
+	// One reusable message buffer per session, in place of ReadMessage.
+	// ReadMessage is NextReader plus io.ReadAll, and io.ReadAll re-grows a
+	// fresh buffer from 512 bytes for every message: on the measured 8KiB
+	// messages that allocated about four times the wire bytes and made the
+	// WebSocket read the single largest allocation source in a 128-stream
+	// profile (57%). Reading into a buffer that keeps its capacity costs
+	// nothing per message; payloads handed onwards are still copied, so
+	// callers keep owning their bytes and nothing about delivery changes.
+	var readBuf bytes.Buffer
+
 	for {
 		// Re-armed before every read: any message resets the watchdog, so
 		// this fires only when the proxy goes silent while holding the
@@ -494,7 +516,12 @@ func (c *HikMediaClient) run(ctx context.Context) error {
 		if d := c.Config.StallTimeout; d > 0 {
 			conn.SetReadDeadline(time.Now().Add(d))
 		}
-		msgType, payload, err := conn.ReadMessage()
+		msgType, reader, err := conn.NextReader()
+		if err == nil {
+			readBuf.Reset()
+			_, err = readBuf.ReadFrom(reader)
+		}
+		payload := readBuf.Bytes()
 		if err != nil {
 			// Context cancellation is not an error
 			if ctx.Err() != nil {
@@ -550,16 +577,16 @@ func (c *HikMediaClient) run(ctx context.Context) error {
 					if c.Config.Verbose {
 						log.Printf("Raw video frame: %d bytes", len(buf))
 					}
-					emit(streamEvent{kind: evVideo, data: buf})
+					emit(streamEvent{kind: evVideo, data: clone(buf)})
 					break
 				}
 
 				pType, pData := msg.Type, msg.Payload
 				switch pType {
 				case MsgTypeVideoData:
-					emit(streamEvent{kind: evVideo, data: pData})
+					emit(streamEvent{kind: evVideo, data: clone(pData)})
 				case MsgTypeAudioData:
-					emit(streamEvent{kind: evAudio, data: pData})
+					emit(streamEvent{kind: evAudio, data: clone(pData)})
 				case MsgTypeSessionError:
 					err := fmt.Errorf("session error: %s", string(pData))
 					if c.OnError != nil {
