@@ -8,8 +8,11 @@ Hikvision Private WebSocket Protocol Client
 协议流程:
 1. 通过 proxy URL 解析目标设备信息
 2. 建立 media WebSocket 连接并发送认证请求
-3. 使用服务器下发的 PKD、rand 生成密钥
-4. 接收并解密加密视频流
+3. 使用服务器下发的 PKD、rand 生成密钥（仅用于会话鉴权，媒体负载本身不加密）
+4. 接收媒体消息，交给 hik_media 还原成视频访问单元
+
+本文件只管传输：WebSocket 帧、鉴权、协议封包、心跳与重连。RTP 判定/剥离、MPEG-PS
+解复用、SPS 与 SDP 解析都在 hik_media 里（只依赖标准库，可单独测试）。
 
 Author: Daikx (代可行)
 """
@@ -30,6 +33,8 @@ from Crypto.Util.Padding import pad
 from dataclasses import dataclass
 from typing import Optional, Callable
 
+import hik_media
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -40,7 +45,7 @@ class HikConfig:
     # 代理服务器地址
     proxy_host: str
     proxy_port: int
-    proxy_path: str  # e.g., "/proxy/[fd00:0:2c0:9::10c]:559"
+    proxy_path: str  # e.g., "/proxy/[1111::2222]:559"
 
     # 目标设备信息（从 URL 路径解析）
     device_ip: str  # 可能是 IPv4 或 IPv6
@@ -195,19 +200,8 @@ class HikProtocol:
 
     @staticmethod
     def unpack_message(data: bytes) -> tuple:
-        """解包海康威视协议消息"""
-        if len(data) < 5:
-            return None, None, data
-
-        msg_type, length = struct.unpack('>BI', data[:5])
-
-        if len(data) < 5 + length:
-            return None, None, data
-
-        payload = data[5:5+length]
-        remaining = data[5+length:]
-
-        return msg_type, payload, remaining
+        """解包海康威视协议消息（转发到 hik_media，统一实现）"""
+        return hik_media.unpack_message(data)
 
 
 class HikWebSocketClient:
@@ -653,10 +647,128 @@ class HikMediaClient(HikWebSocketClient):
         self._server_version: str = ""
         self._server_stream_key: str = ""
 
+        # 媒体解析层状态（与 go-client 一一对应）
+        self._rtp = hik_media.RTPDetector()
+        self._ps: Optional[hik_media.PSDemuxer] = None
+        self._media_info: Optional[hik_media.MediaInfo] = None
+        self._container_known: bool = False
+        self._frame_index: int = 0
+        self._stream_start: Optional[float] = None
+
+        # 媒体层回调
+        self.on_frame: Optional[Callable[[hik_media.FrameMeta, bytes], None]] = None
+        self.on_media_info: Optional[Callable[[hik_media.MediaInfo], None]] = None
+        self.on_sps: Optional[Callable[[bytes], None]] = None
+        self.on_raw_video: Optional[Callable[[bytes], None]] = None
+
+    def _reset_media_state(self):
+        """重置媒体解析层。run_forever 会在同一个对象上重连，上一会话的 RTP 判定、
+        PS 半帧和 SDP 都不能带进新会话——设备可能换了编码，甚至换了容器。"""
+        self._rtp = hik_media.RTPDetector()
+        self._ps = None
+        self._media_info = None
+        self._container_known = False
+        self._frame_index = 0
+        self._stream_start = None
+
+    def _feed_video(self, data: bytes):
+        """视频负载入口。RTP 判定器会扣住开头几条消息直到能定性，所以一次喂入可能
+        放出 0 条、1 条或多条负载。"""
+        for payload in self._rtp.feed(data):
+            self._feed_container(payload)
+
+    def _feed_container(self, data: bytes):
+        """处理一条已去封装的负载。
+
+        MPEG-PS 容器必须先解复用成访问单元：设备会把单个 NAL 拆到多个 PES 包里，
+        原始 PS 字节当 annex-b 扫起始码是错的。其余容器原样下发。
+        """
+        self._safe_callback(self.on_raw_video, data)
+
+        # 容器只在会话的第一条负载上判一次。MEDIAINFO 头只是线索：有一类设备的头
+        # magic 是 HVAG 而非 IMKH，解不出来，container 为空但负载明明是 MPEG-PS，
+        # 只能靠嗅探定性——而且只能在第一条上嗅，后续消息都是从 pack 中段续传的。
+        if not self._container_known:
+            self._container_known = True
+            info = self._media_info
+            if (info is not None and info.container == "PS") or \
+               ((info is None or info.container == "") and hik_media.is_ps_data(data)):
+                self._ps = hik_media.PSDemuxer()
+                # 把嗅探结论写回去：对 HVAG 那一类设备这是容器的唯一来源，它隐含的
+                # 90kHz PS 时钟又是 PTS 能换算成帧率的前提。不写回，调用方会在一条
+                # 正被当 PS 解复用的流上读到空容器。
+                if info is not None and info.container == "":
+                    info.container = "PS"
+                    info.clock_rate = 90000
+
+        if self._ps is None:
+            self._deliver_frame(data, 0, False)
+            return
+        for frame in self._ps.feed(data):
+            self._deliver_frame(frame.data, frame.pts, frame.has_pts)
+
+    def _deliver_frame(self, data: bytes, pts: int, has_pts: bool):
+        """补齐单帧元信息后交给调用方。
+
+        on_frame 优先于 on_video_data，避免同一份负载下发两次；只设 on_video_data
+        的老调用方行为不变（收到的仍是可直接喂解码器的基本流）。
+        """
+        if self.on_frame is None and self.on_video_data is None:
+            return
+        if self._stream_start is None:
+            self._stream_start = time.monotonic()
+        self._frame_index += 1
+
+        info = self._media_info
+        codec = info.codec if info is not None else ""
+        # 与容器同理：解不出的 MEDIAINFO 头会让编码为空，没有编码就判不了关键帧、
+        # 也还原不了分辨率。码流自己会说它是什么编码。
+        if not codec:
+            codec = hik_media.sniff_codec(data)
+            if codec and info is not None:
+                info.codec = codec
+        # 分辨率只能从码流内 SPS 还原（MEDIAINFO 头不带）。PS 流在第一个关键帧上补齐。
+        if codec and (info is None or info.width == 0):
+            width, height, sps, ok = hik_media.recover_resolution(data, codec)
+            if ok:
+                if info is not None:
+                    info.width, info.height = width, height
+                if sps:
+                    self._safe_callback(self.on_sps, sps)
+
+        elapsed = time.monotonic() - self._stream_start
+        meta = hik_media.FrameMeta(
+            frame_index=self._frame_index,
+            is_key_frame=hik_media.analyze_frame(data, codec),
+            codec=codec,
+            timestamp_ms=int(elapsed * 1000),
+        )
+        if has_pts:
+            meta.pts, meta.has_pts = pts, True
+        elif info is not None and info.clock_rate > 0:
+            meta.pts = int(elapsed * info.clock_rate)
+        if info is not None:
+            meta.width, meta.height = info.width, info.height
+
+        if self.on_frame is not None:
+            self._safe_callback(self.on_frame, meta, data)
+            return
+        self._safe_callback(self.on_video_data, data)
+
+    def _flush_media(self):
+        """流结束时把还压在手里的东西放出去：先是 RTP 判定器为定性扣住的负载，
+        再是解复用器里的最后一个访问单元。顺序不能反——扣住的负载得先进解复用器。"""
+        for payload in self._rtp.flush():
+            self._feed_container(payload)
+        if self._ps is None:
+            return
+        for frame in self._ps.flush():
+            self._deliver_frame(frame.data, frame.pts, frame.has_pts)
+
     def _build_media_url(self) -> str:
         """构建 media WebSocket URL"""
         # media URL 格式: /media?version=0.1&cipherSuites=0&sessionID=&proxy=<device>
-        # device_ip 已经包含括号（如 [fd00:0:2c0:9::10c]），直接拼接
+        # device_ip 已经包含括号（如 [1111::2222]），直接拼接
         proxy = f"{self.config.device_ip}:{self.config.device_port}"
         return f"/media?version={self.config.version}&cipherSuites={self.config.cipher_suites}&sessionID=&proxy={proxy}"
 
@@ -754,6 +866,9 @@ class HikMediaClient(HikWebSocketClient):
         if error_code == 0 and resp.get('sdp'):
             logger.info("realplay success, received SDP")
             logger.debug(f"SDP: {resp['sdp'][:100]}...")
+            info = hik_media.parse_sdp(resp['sdp'])
+            self._media_info = info
+            self._safe_callback(self.on_media_info, info)
         elif error_code != 0:
             friendly_msg = self.ERROR_MESSAGES.get(
                 error_code, f"未知错误 (errorCode: {error_code})")
@@ -764,6 +879,7 @@ class HikMediaClient(HikWebSocketClient):
 
     async def run(self):
         """运行客户端主循环"""
+        self._reset_media_state()
         # 建立 media WebSocket 连接
         media_url = self._build_media_url()
         logger.info(f"Connecting to media endpoint: {media_url}")
@@ -816,7 +932,7 @@ class HikMediaClient(HikWebSocketClient):
                             f"Video stream: {video_count} frames, "
                             f"{video_bytes / 1024:.1f} KB total, last frame {len(payload)} bytes")
                         last_stat_time = now
-                    self._safe_callback(self.on_video_data, payload)
+                    self._feed_video(payload)
 
                 elif msg_type == HikProtocol.MSG_TYPE_AUDIO_DATA:
                     self._safe_callback(self.on_audio_data, payload)
@@ -834,6 +950,8 @@ class HikMediaClient(HikWebSocketClient):
             logger.error(f"Connection error: {e}")
             self._safe_callback(self.on_error, str(e))
         finally:
+            # PS 一个 pack 关掉上一帧，天然压着最后一帧，不 flush 就会丢
+            self._flush_media()
             if self._keepalive_task is not None:
                 self._keepalive_task.cancel()
                 self._keepalive_task = None
@@ -885,7 +1003,7 @@ def parse_proxy_url(url: str) -> HikConfig:
 
     URL 格式: wss://<proxy_host>:<proxy_port>/proxy/<device_ip>:<device_port>/openUrl/<auth>
 
-    例如: wss://ipcbasehkvideolj.example.com.com:6014/proxy/[fd00:0:2c0:9::10c]:559/openUrl/mYqWpMI
+    例如: wss://example.com:6014/proxy/[1111::2222]:559/openUrl/auth_token
 
     返回:
         HikConfig 对象

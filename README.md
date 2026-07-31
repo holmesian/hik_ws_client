@@ -114,24 +114,44 @@ def generate_secret_key(PKD: str, rand: str, username: str, password: str) -> st
 
 ### 5. 视频数据 (MSG_TYPE_VIDEO_DATA = 0x40)
 
-服务器发送加密的视频帧：
+媒体负载**不加密**（密钥交换只用于会话鉴权）。代理下发的是容器字节，123 台真机摸底
+实测共三种形态：
 
-- 帧头包含时间戳、帧类型、长度等信息
-- 视频数据使用 AES-CBC 加密
-- 密钥是之前生成的 secret_key
+| 形态           | 表现                                    | 处理                                   |
+| -------------- | --------------------------------------- | -------------------------------------- |
+| 裸 MPEG-PS     | 消息以 `00 00 01 XX` 起始码开头          | 直接解复用                             |
+| RTP 包裹的 PS  | 每个包 12 字节 RTP 头，SSRC 恒定、序号 +1 | 先剥 RTP 头，再解复用                  |
+| 首包被拆       | 首个 RTP 包被拆成 8192 + 12 两条消息      | 判定窗口取前 4 条，找一对互证的包       |
 
-### 6. 帧格式
+**判定必须是会话级的**：逐条消息判 RTP 会把裸 PS 的续传消息（任意字节有 1/4 概率高
+两位是 `0b10`）误判成 RTP，静默砍掉 12 字节，而帧数、关键帧数、分辨率全都正常。
 
-```
-┌─────────────────────────────────────────────────────┐
-│  0x24 0x34  │ 0x00 0x00  │ [4B length] │ ...      │
-│  固定头     │ 保留        │ 数据长度     │ 负载数据  │
-└─────────────────────────────────────────────────────┘
-```
+### 6. MPEG-PS 容器
 
-- **帧类型判断**：检查数据第5个字节的最低位
-  - `0x01`：关键帧 (I-Frame)
-  - `0x02`：P-Frame
+一个 pack 承载一个访问单元，`00 00 01 BA` 的 pack 头关掉上一帧——因此天然有一帧延迟，
+流结束必须 flush，否则丢最后一帧。
+
+| 起始码        | 内容                | 处理                                    |
+| ------------- | ------------------- | --------------------------------------- |
+| `00 00 01 BA` | pack 头             | 关闭上一个访问单元                      |
+| `00 00 01 BC` | PSM                 | 跳过                                    |
+| `00 00 01 E0` | 视频 PES            | 去掉 3 字节可选头后拼进当前访问单元      |
+| `00 00 01 C0` | 音频 PES            | 跳过                                    |
+| `00 00 01 BD` | private_stream_1    | **跳过**（见下）                        |
+
+**`0xBD` 私有流不含云台信息。** 94 台设备的全量普查：82 台每秒发一条 96 字节
+`00020017` 记录（ECB 加密，无设备密钥无法验证内容），12 台发 24 字节常量记录，另有
+两台各自的私有记录。没有任何一类携带坐标、角度或定位数据。它自带 PTS，当视频处理会
+把密文拼进码流、并把帧时间戳取成私有包的——所以解复用器只跳过它，不解析、不外露。
+
+### 7. 分辨率与编码
+
+`a=Media_header:MEDIAINFO=<hex>` 头给出容器和编码，但**不含分辨率**；且有一类设备的
+头 magic 是 `HVAG` 而非 `IMKH`，本客户端解不出来。因此容器靠嗅探兜底、编码靠 NAL 头
+嗅探兜底、分辨率一律从码流内的 SPS 还原。
+
+PS 的时间戳恒为 90kHz，**不能采信 SDP 的 rtpmap**：有设备在 video m-line 上写
+`a=rtpmap:8 PCMA/8000`，照抄会把 25fps 的流算成 2.22fps。
 
 ## 协议消息类型
 
@@ -193,7 +213,9 @@ python3 demo.py "wss://..." --username admin --password yourpassword
 # 启用详细输出
 python3 demo.py "wss://..." -v
 
-# 断
+# 断线自动重连
+python3 demo.py "wss://..." --reconnect
+```
 
 ### API 使用
 
@@ -220,16 +242,33 @@ async def main():
     client = HikMediaClient(config)
 
     # 设置回调
-    def on_video(data):
-        print(f"Video: {len(data)} bytes")
+    def on_frame(meta, data):
+        # data 是一个完整的 annex-b 访问单元，可直接喂解码器
+        print(f"#{meta.frame_index} {meta.codec} {meta.width}x{meta.height} "
+              f"key={meta.is_key_frame} pts={meta.pts} {len(data)} bytes")
 
-    client.on_video_data = on_video
+    client.on_frame = on_frame
 
     # 运行
     await client.run()
 
 asyncio.run(main())
 ```
+
+### 回调
+
+| 回调             | 参数                  | 说明                                                        |
+| ---------------- | --------------------- | ----------------------------------------------------------- |
+| `on_frame`       | `(FrameMeta, bytes)`  | 单个访问单元 + 元信息（编码/分辨率/关键帧/PTS）              |
+| `on_video_data`  | `(bytes,)`            | 同样是解复用后的访问单元，只是不带元信息；设了 `on_frame` 时不再触发 |
+| `on_media_info`  | `(MediaInfo,)`        | SDP 解析结果（容器、编码、时钟、SPS）                        |
+| `on_sps`         | `(bytes,)`            | 从码流里还原出的 SPS NAL（含起始码）                         |
+| `on_raw_video`   | `(bytes,)`            | 去掉 RTP 封装、进解复用器之前的容器字节，用于抓流存档        |
+| `on_audio_data`  | `(bytes,)`            | 音频消息原样下发                                             |
+| `on_error`       | `(str,)`              | 会话错误                                                     |
+
+`FrameMeta`：`frame_index / is_key_frame / codec / width / height / pts / has_pts /
+timestamp_ms`。`has_pts` 为真时 `pts` 是容器给的 90kHz 时间戳，否则是按到达时间合成的。
 
 ### 保存视频帧
 
@@ -238,20 +277,32 @@ asyncio.run(main())
 python3 demo.py "wss://..." --save-frames --output-dir ./frames
 ```
 
-## 已知问题
+## 测试
 
-1. **IPv6 支持**：代码已支持 IPv6 设备地址，但需要完整测试
-2. **视频解码**：当前只保存原始帧数据，未实现 H.264/H.265 解码
-3. **音频处理**：音频流未完整解析
+```bash
+# Python 媒体解析层（只依赖标准库，无需装任何东西）
+python3 -m unittest test_hik_media -v
+
+# Go 客户端
+cd go-client && go test -race ./...
+```
+
+两套测试都会回放 `samples/` 里的真机采集并断言同一组帧数、关键帧数和分辨率——任一侧
+的解析改坏了，回放数字就会对不上。样本由 Git LFS 管理，跑之前先 `git lfs pull`
+（没拉取时用例会跳过并提示，不会误报失败）。
 
 ## 文件结构
 
 ```
 hik_ws_client/
-├── hik_ws_client.py    # 核心协议实现
-├── demo.py             # 演示程序
-├── README.md           # 本文档
-└── output/             # 视频帧输出目录
+├── hik_ws_client.py     # 传输层：WebSocket、鉴权、协议封包、重连
+├── hik_media.py         # 媒体解析层：RTP 判定/剥离、PS 解复用、SPS、SDP（仅标准库）
+├── test_hik_media.py    # 媒体层回归测试 + 真机样本回放
+├── demo.py              # 演示程序
+├── play.py              # FFmpeg + OpenCV 实时播放
+├── go-client/           # Go 实现（同一套解析逻辑，含 e2e 探针）
+├── samples/             # 真机 MPEG-PS 采集（Git LFS），见 samples/README.md
+└── README.md            # 本文档
 ```
 
 ## 依赖
@@ -296,80 +347,25 @@ pip install -r requirements.txt
 
 ```
 
-## 视频帧显示和处理
+## 播放与解码
 
-### 当前状态
-
-当前版本实现了视频流的**接收和原始数据保存**，但**未包含视频解码**。获取的原始数据是 RTP 打包的 G.711 音频和视频编码数据（如 H.264/H.265）。
-
-### 显示视频的方法
-
-#### 方法1: 使用 demo.py 保存帧（推荐用于调试）
+客户端交付的是完整的 annex-b 访问单元，可直接喂给解码器；本仓库不内置解码。
 
 ```bash
-# 保存原始帧数据到文件
-python3 demo.py "wss://..." --save-frames --output-dir ./frames
+# FFmpeg 解码 + OpenCV 实时显示
+python3 play.py "wss://..."
 ```
 
-保存的原始帧可用于后续解码分析。
+`play.py` 把 `on_video_data` 收到的访问单元写进 ffmpeg 的 stdin，读回 MJPEG 显示。
+自己接解码器时同理：`on_frame` 的 `data` 直接写管道即可，不需要再做 RTP 解包或
+容器解析。
 
-#### 方法2: 使用回调函数处理视频数据
+## 已知限制
 
-```python
-import asyncio
-from hik_ws_client import HikMediaClient, HikConfig, parse_proxy_url
-
-async def main():
-    url = "wss://..."
-    config = parse_proxy_url(url)
-    client = HikMediaClient(config)
-
-    # 设置视频帧回调
-    def on_video_frame(data: bytes):
-        # data 是原始视频帧数据
-        print(f"Received video frame: {len(data)} bytes")
-        # 在这里可以实现解码和显示
-
-    client.on_video_data = on_video_frame
-
-    # 运行
-    await client.run()
-
-asyncio.run(main())
-```
-
-#### 方法3: 集成 OpenCV 显示（需要额外解码）
-
-完整的视频显示需要：
-
-1. 解析 RTP 头获取视频数据
-2. 解码 H.264/H.265
-3. 使用 OpenCV/PyGame 显示
-
-示例框架：
-
-```python
-import cv2
-import numpy as np
-
-def display_frame(encoded_data: bytes):
-    """
-    需要实现:
-    1. RTP 解包
-    2. H.264/H.265 解码 (可使用 ffmpeg-python 或 decord)
-    3. OpenCV 显示
-    """
-    # 这是一个框架，需要根据实际编码格式实现
-    pass
-```
-
-### 后续工作
-
-1. 实现完整的视频解码（H.264/H.265）
-2. 添加音频解码支持
-3. 实现播放控制（暂停、恢复、seek）
-4. 添加 PTZ 云台控制
-5. 完善错误处理和重连机制
+1. **音频**：音频消息原样下发（`on_audio_data`），未解析 PES、未解码。
+2. **云台**：码流里没有云台信息。94 台设备全量普查确认 `0xBD` 私有流不含坐标/角度，
+   PTZ 需要走设备的独立控制接口，不在本客户端范围内。
+3. **加密的私有流**：`0xBD` 记录为 ECB 加密，无设备密钥，内容无法验证。
 
 ---
 
@@ -378,12 +374,6 @@ def display_frame(encoded_data: bytes):
 - `h5player.min.js`：海康威视 Web 播放器核心代码
 - `Decoder.js`：WebAssembly 解码器 JavaScript 接口
 - `DecodeWorker.js`：解码器 Web Worker
-- `hik.txt`：协议流程分析记录
-
-## 后续工作
-
-1. 实现完整的视频解码（H.264/H.265）
-2. 添加音频解码支持
-3. 实现播放控制（暂停、恢复、seek）
-4. 添加 PTZ 云台控制
+- `hik_ws.txt`：协议流程分析记录
+- `samples/README.md`：真机采集样本与全量摸底结论
 5. 完善错误处理和重连机制

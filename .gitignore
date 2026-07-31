@@ -1,4 +1,6 @@
+# 临时调试脚本不入库，但正式单元测试要入库
 test_*
+!test_hik_media.py
 
 *.pyc
 __pycache__
