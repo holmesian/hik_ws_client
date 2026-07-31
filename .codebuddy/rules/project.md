@@ -34,6 +34,11 @@ Go 与 Python 是**同一套解析逻辑的两个实现，Go 为准**。
   一致"的东西，其它形式的对齐（读代码、看注释）都不算。
 - 只在一侧修的例外只有一种：该侧独有的工程设施（如 Go 的 `AsyncDelivery`）。这类改动不得
   改变交付给调用方的字节。
+- **内存/分配策略属于这类工程设施，不是解析行为。** Go 侧两处缓冲复用（`closeAU` 精确尺寸
+  拷贝 + 累加器保留容量、读循环复用 `bytes.Buffer` + 净荷 `clone`）已核验与 Python 侧
+  （`hik_media.py._close_au`、`hik_ws_client.py._parse_ws_frame`/`receive_message`）交付字节
+  逐位相同，**不要把它们"同步"到 Python**——CPython 的 `bytearray` 不保留容量、扩容因子只有
+  1.125，照抄换不来收益。依据与复现方法见 `docs/media-pipeline.md`。
 
 ## 文档结构
 
