@@ -5,7 +5,7 @@ status: Proposed
 date: 2026-07-31
 deciders: DataStation 架构师；待项目 owner 确认
 related_rules: project.md, media-parsing.md
-related_docs: samples/README.md, docs/media-pipeline.md
+related_docs: samples/README.md, docs/media-pipeline.md, docs/ptz-stream-observability.md
 ---
 
 # ADR-0004 组件边界——只做取流与解复用，不解码、不解密、不解析私有流、不做 PTZ
@@ -27,6 +27,12 @@ related_docs: samples/README.md, docs/media-pipeline.md
   的行为一致（官方播放器同样不解析 0xBD，PTZ 走设备 ISAPI/HTTP 接口）。
 - **解码**：`play.py` / `screenshot.go` 都是把访问单元原样喂 ffmpeg，本仓库不内置解码器。
 - **音频**：音频消息原样下发，未解 PES、未解码，目前无下游需求。
+- **云台可观测性**：上面的 `0xBD` 结论来自静置普查。补做的受控差分实测（转动期间实时抓同一
+  条流，19 次采集 / 64 次转动 / 8 次静置对照）进一步确认：WS 文本、WS 二进制未知类型、`0xBD`、
+  码流内 SEI 四层在转动窗口内外**零变化**；唯一有信号的编码器间接层（P 帧膨胀）测的是**场景
+  变化**而非云台状态——静置对照组的自然场景事件（54.5x）比 64 次真实转动的最强扰动（38.6x）
+  还大，物理上分不开"云台在转"与"有人从镜头前走过"。想知道方位只能问设备控制接口，码流侧
+  做不到。把这层信号包装成 `IsPanning()` 会给调用方一个约 30% 漏报、每分钟一次误报的假承诺。
 
 ## 决策（Decision）
 
@@ -52,4 +58,6 @@ related_docs: samples/README.md, docs/media-pipeline.md
 ## 备注（Notes）
 
 - 关联规则：`.codebuddy/rules/project.md`、`.codebuddy/rules/media-parsing.md`（第 5 条）
-- 实测证据：`samples/README.md`「0xBD 私有流里有什么（以及没有 PTZ 坐标）」
+- 实测证据（静置）：`samples/README.md`「0xBD 私有流里有什么（以及没有 PTZ 坐标）」
+- 实测证据（转动）：`docs/ptz-stream-observability.md`「云台转动时，码流里能不能看出来」——
+  受控差分实验，结论"不能"，逐层数据、误报分析与复现方式在内。
