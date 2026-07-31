@@ -271,6 +271,64 @@ func TestIntegration_OnVideoDataOnly(t *testing.T) {
 	}
 }
 
+// TestIntegration_BatchedFrameConsumedToTail locks the authoritative
+// behaviour Python was diverging from: a binary frame may carry several
+// protocol messages, and the read loop must keep unpacking until the frame
+// is exhausted. Stopping after the first message drops the rest silently —
+// nothing errors, the frame counter just runs low.
+//
+// The tail here cannot be unpacked (rawFrame's four declared length bytes
+// exceed what is left), so it must be delivered as raw video, in order,
+// after the two messages that preceded it.
+func TestIntegration_BatchedFrameConsumedToTail(t *testing.T) {
+	cfg := startMock(t, func(t *testing.T, conn *websocket.Conn) {
+		sendAuth(t, conn)
+		expectRealplay(t, conn)
+		_ = conn.WriteJSON(map[string]interface{}{"errorCode": 0, "sdp": testSDP})
+
+		batch := PackMessage(MsgTypeVideoData, idrFrame)
+		batch = append(batch, PackMessage(MsgTypeVideoData, pFrame)...)
+		batch = append(batch, rawFrame...)
+		_ = conn.WriteMessage(websocket.BinaryMessage, batch)
+		_ = conn.WriteMessage(websocket.BinaryMessage, PackMessage(MsgTypeSessionError, []byte("bye")))
+		time.Sleep(200 * time.Millisecond)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := connectAndPlay(t, cfg, ctx)
+
+	var mu sync.Mutex
+	var payloads [][]byte
+	c.OnVideoData = func(b []byte) {
+		mu.Lock()
+		payloads = append(payloads, append([]byte(nil), b...))
+		mu.Unlock()
+	}
+	c.OnError = func(error) {}
+
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("Run did not return")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := [][]byte{idrFrame, pFrame, rawFrame}
+	if len(payloads) != len(want) {
+		t.Fatalf("payloads = %d, want %d (frame not consumed to the tail): %v",
+			len(payloads), len(want), payloads)
+	}
+	for i := range want {
+		if string(payloads[i]) != string(want[i]) {
+			t.Errorf("payload %d = %x, want %x", i, payloads[i], want[i])
+		}
+	}
+}
+
 // TestIntegration_ServerErrorText verifies the realplay failure path.
 func TestIntegration_ServerErrorText(t *testing.T) {
 	cfg := startMock(t, func(t *testing.T, conn *websocket.Conn) {

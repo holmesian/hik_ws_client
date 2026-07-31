@@ -29,7 +29,7 @@
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # MPEG-PS 起始码（00 00 01 之后的那个字节）
@@ -67,6 +67,26 @@ def unpack_message(data: bytes) -> Tuple[Optional[int], Optional[bytes], bytes]:
     payload = data[5:5 + length]
     remaining = data[5 + length:]
     return msg_type, payload, remaining
+
+
+def iter_messages(data: bytes) -> Iterator[Tuple[Optional[int], bytes]]:
+    """把一段字节里串联的协议消息**全部**解出来，逐条产出 ``(msg_type, payload)``。
+
+    一个 WebSocket 帧里可以串多条协议消息，只解第一条就是静默丢帧——设备把视频和
+    音频打包进同一帧时，丢的是整条音轨。必须消费到尾。
+
+    某处解不出来（头不完整或声明长度超过剩余字节）时，把**剩下的整段**作为
+    ``(None, tail)`` 产出后停止，由调用方按原始视频处理；这与 Go ``client.go`` 读
+    循环里 ``Unpack`` 失败即 ``emit(evVideo, buf); break`` 是同一语义。``data`` 为空
+    时不产出任何东西。
+    """
+    while data:
+        msg_type, payload, remaining = unpack_message(data)
+        if msg_type is None:
+            yield None, data
+            return
+        yield msg_type, payload
+        data = remaining
 
 
 # ---------------------------------------------------------------------------

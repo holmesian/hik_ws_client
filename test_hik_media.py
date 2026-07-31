@@ -15,6 +15,7 @@
 运行：``python3 -m unittest test_hik_media -v``
 """
 
+import asyncio
 import os
 import unittest
 
@@ -124,6 +125,56 @@ class TestUnpack(unittest.TestCase):
         self.assertIsNone(msg_type)
         self.assertIsNone(payload)
         self.assertEqual(remaining, data)
+
+
+class TestIterMessages(unittest.TestCase):
+    """一个 WebSocket 帧里串多条协议消息时必须消费到尾。
+
+    只解第一条的那一版：帧数、关键帧数、分辨率全对，丢掉的是同帧内的后续消息——
+    正是 `.codebuddy/rules/testing.md` 第一条说的"计数不算验证"。这里不经过网络，
+    直接对字节断言，无第三方依赖，任何环境都跑得到。
+    """
+
+    @staticmethod
+    def _msg(msg_type: int, payload: bytes) -> bytes:
+        """手写 5 字节协议头：1 字节类型 + 4 字节大端长度。"""
+        return bytes([msg_type]) + len(payload).to_bytes(4, "big") + payload
+
+    def test_two_video_messages_in_one_frame(self):
+        frame = self._msg(0x40, b"AAAA") + self._msg(0x40, b"BBBB")
+        self.assertEqual(list(m.iter_messages(frame)),
+                         [(0x40, b"AAAA"), (0x40, b"BBBB")])
+
+    def test_mixed_types_in_one_frame(self):
+        """设备会把视频、音频、心跳打进同一帧；只取第一条丢的是整条音轨。"""
+        frame = (self._msg(0x40, b"video") + self._msg(0x41, b"audio")
+                 + self._msg(0x06, b"") + self._msg(0x40, b"video2"))
+        self.assertEqual(list(m.iter_messages(frame)),
+                         [(0x40, b"video"), (0x41, b"audio"),
+                          (0x06, b""), (0x40, b"video2")])
+
+    def test_unparseable_tail_is_raw_video(self):
+        """消费掉 N 条之后解不出来的尾巴，按 Go 的语义把剩下的整段当原始视频交出去，
+        不是丢掉、也不是只丢那一小截。"""
+        tail = bytes([0x00, 0x00, 0x01, 0xBA])  # 5 字节都不够，头不完整
+        frame = self._msg(0x40, b"AAAA") + tail
+        self.assertEqual(list(m.iter_messages(frame)),
+                         [(0x40, b"AAAA"), (None, tail)])
+
+    def test_truncated_payload_tail_keeps_its_header(self):
+        """声明长度超过剩余字节：整段（含那 5 字节头）都当原始视频，不能切开。"""
+        tail = bytes([0x40, 0x00, 0x00, 0x10, 0x00]) + b"short"
+        frame = self._msg(0x40, b"AAAA") + tail
+        self.assertEqual(list(m.iter_messages(frame)),
+                         [(0x40, b"AAAA"), (None, tail)])
+
+    def test_whole_frame_unparseable(self):
+        """第一条就解不出来：整帧当原始视频，与修复前行为一致。"""
+        raw = bytes([0x00, 0x00, 0x00, 0x01, 0x65, 0x88])
+        self.assertEqual(list(m.iter_messages(raw)), [(None, raw)])
+
+    def test_empty_frame_yields_nothing(self):
+        self.assertEqual(list(m.iter_messages(b"")), [])
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +651,123 @@ class TestClientWiring(unittest.TestCase):
         self.assertIsNone(c._ps)
         self.assertFalse(c._container_known)
         self.assertEqual(c._frame_index, 0)
+
+
+# ---------------------------------------------------------------------------
+# 单帧多协议消息的传输层接线（同样需要 pycryptodome / websockets）
+#
+# 循环解包本身由上面的 TestIterMessages 无条件覆盖；这里只查接线：
+# receive_message 一次只返回一个元组，同帧内的第 2..N 条是否真的还交付得出来。
+# ---------------------------------------------------------------------------
+def ws_frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
+    """手写一个服务器→客户端的 WebSocket 帧（不掩码，RFC 6455 §5.2）。
+
+    只支持 <126 字节的净荷，够用；不复用实现里的 _make_ws_frame——那个是客户端帧
+    构造器（带掩码），与实现同源的构造器会跟着实现一起把字段摆错。
+    """
+    assert len(payload) < 126
+    return bytes([(0x80 if fin else 0x00) | opcode, len(payload)]) + payload
+
+
+def protocol_msg(msg_type: int, payload: bytes) -> bytes:
+    """手写 5 字节协议头：1 字节类型 + 4 字节大端长度。"""
+    return bytes([msg_type]) + len(payload).to_bytes(4, "big") + payload
+
+
+class _EOFReader:
+    """buffer 之外没有更多字节：读 socket 一律 EOF。"""
+
+    async def read(self, _n):
+        return b""
+
+
+@unittest.skipIf(HikMediaClient is None, "缺少 pycryptodome/websockets，跳过客户端接线用例")
+class TestMultiMessageFrameWiring(unittest.TestCase):
+    VIDEO = 0x40
+    AUDIO = 0x41
+
+    def _client(self):
+        cfg = HikConfig(proxy_host="h", proxy_port=443, proxy_path="/proxy/1.2.3.4:80",
+                        device_ip="1.2.3.4", device_port=80)
+        return HikMediaClient(cfg)
+
+    def _drain(self, wire: bytes, count: int):
+        """把 wire 当成已经收在 buffer 里的字节，连续取 count 条消息。
+
+        socket 一侧接的是 EOF：消息本该从 buffer 里取到，取不到才会去读 socket。
+        真丢了消息时结果里会出现 ``("EOF", None)``，一眼能看出丢在第几条。
+        """
+        c = self._client()
+        c.connected = True
+        c.buffer = bytearray(wire)
+        c.reader = _EOFReader()
+
+        async def collect():
+            got = []
+            for _ in range(count):
+                try:
+                    got.append(await c.receive_message())
+                except ConnectionError:
+                    got.append(("EOF", None))
+            return got
+
+        return c, asyncio.run(collect())
+
+    def test_all_messages_in_one_frame_are_delivered(self):
+        """单帧内视频 + 音频 + 视频：三条都要按顺序交付，一条都不能少。"""
+        wire = ws_frame(0x02, protocol_msg(self.VIDEO, b"AAAA")
+                        + protocol_msg(self.AUDIO, b"pcm")
+                        + protocol_msg(self.VIDEO, b"BBBB"))
+        _, got = self._drain(wire, 3)
+        self.assertEqual(got, [(self.VIDEO, b"AAAA"),
+                               (self.AUDIO, b"pcm"),
+                               (self.VIDEO, b"BBBB")])
+
+    def test_queued_messages_come_before_the_next_frame(self):
+        """排队的第 2 条必须先于下一个 WS 帧的第 1 条交付，否则就是乱序。"""
+        wire = (ws_frame(0x02, protocol_msg(self.VIDEO, b"A1") + protocol_msg(self.VIDEO, b"A2"))
+                + ws_frame(0x02, protocol_msg(self.VIDEO, b"B1")))
+        _, got = self._drain(wire, 3)
+        self.assertEqual(got, [(self.VIDEO, b"A1"), (self.VIDEO, b"A2"), (self.VIDEO, b"B1")])
+
+    def test_tail_that_cannot_be_unpacked_is_raw_video(self):
+        """消费掉一条之后解不出来的尾巴，按原始视频交付（WS_OP_BINARY 在 run() 里
+        与协议视频走同一条喂入路径，等价于 Go 的 evVideo）。"""
+        tail = bytes([0x00, 0x00, 0x01, 0xBA])
+        wire = ws_frame(0x02, protocol_msg(self.VIDEO, b"AAAA") + tail)
+        c, got = self._drain(wire, 2)
+        self.assertEqual(got, [(self.VIDEO, b"AAAA"), (c.WS_OP_BINARY, tail)])
+
+    def test_whole_frame_unparseable_unchanged(self):
+        """整帧就解不出来时行为不变：整段当原始视频。"""
+        raw = bytes([0x00, 0x00, 0x00, 0x01, 0x65, 0x88])
+        c, got = self._drain(ws_frame(0x02, raw), 1)
+        self.assertEqual(got, [(c.WS_OP_BINARY, raw)])
+
+    def test_fragmented_frame_multi_message(self):
+        """分片重组后的多消息帧走的是另一个 _dispatch_data_frame 调用点，
+        只修非分片那条路就是留一半的洞。"""
+        batch = protocol_msg(self.VIDEO, b"AAAA") + protocol_msg(self.VIDEO, b"BBBB")
+        wire = ws_frame(0x02, batch[:7], fin=False) + ws_frame(0x00, batch[7:], fin=True)
+        _, got = self._drain(wire, 2)
+        self.assertEqual(got, [(self.VIDEO, b"AAAA"), (self.VIDEO, b"BBBB")])
+
+    def test_handshake_queue_survives_into_stream_loop(self):
+        """握手阶段（authenticate）与取流主循环是同一个 receive_message 的两个消费方；
+        握手那一帧里排上队的后续消息，进主循环后必须还取得到。"""
+        wire = ws_frame(0x01, b'{"errorCode":0}') + ws_frame(
+            0x02, protocol_msg(self.VIDEO, b"AAAA") + protocol_msg(self.VIDEO, b"BBBB"))
+        c, got = self._drain(wire, 3)
+        self.assertEqual(got, [(c.WS_OP_TEXT, b'{"errorCode":0}'),
+                               (self.VIDEO, b"AAAA"), (self.VIDEO, b"BBBB")])
+
+    def test_close_clears_pending_queue(self):
+        """重连走的是同一个对象：上一会话没取完的排队消息不能带进新会话。"""
+        wire = ws_frame(0x02, protocol_msg(self.VIDEO, b"AAAA") + protocol_msg(self.VIDEO, b"BBBB"))
+        c, _ = self._drain(wire, 1)
+        self.assertTrue(c._pending_messages, "第 2 条应当还排在队里")
+        asyncio.run(c.close())
+        self.assertFalse(c._pending_messages)
 
 
 if __name__ == "__main__":

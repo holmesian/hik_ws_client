@@ -30,8 +30,9 @@ import struct
 import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Callable, Deque, Optional
 
 import hik_media
 
@@ -248,6 +249,10 @@ class HikWebSocketClient:
         self._frag_opcode: Optional[int] = None
         self._frag_buffer = bytearray()
 
+        # 同一个 WS 帧里可以串多条协议消息，而 receive_message 一次只交得出一条，
+        # 第 2..N 条在这里排队等后续调用取走
+        self._pending_messages: Deque[tuple] = deque()
+
         # 状态机
         self.state = "disconnected"
 
@@ -431,6 +436,7 @@ class HikWebSocketClient:
             self.buffer = bytearray(response[header_end + 4:])
             self._frag_opcode = None
             self._frag_buffer = bytearray()
+            self._pending_messages.clear()
 
             # 检查状态码
             status_line = http_header.decode('ascii', errors='replace').split('\r\n')[0]
@@ -489,6 +495,7 @@ class HikWebSocketClient:
         self.buffer = bytearray()
         self._frag_opcode = None
         self._frag_buffer = bytearray()
+        self._pending_messages.clear()
 
         logger.info("Connection closed")
 
@@ -516,16 +523,24 @@ class HikWebSocketClient:
         await self.writer.drain()
 
     def _dispatch_data_frame(self, opcode: int, payload: bytes) -> tuple:
-        """将完整的数据帧转换为 (msg_type, payload) 返回值"""
+        """把一个完整的数据帧转换成 (msg_type, payload)，同帧内的后续消息入队。
+
+        一个 BINARY 帧里可以串多条协议消息（设备会把视频和音频打进同一帧），
+        只解第一条会把其余的静默丢掉。解包循环在 hik_media.iter_messages 里，
+        这里只负责把结果接住：第一条直接返回，第 2..N 条排进 _pending_messages。
+        """
         if opcode == self.WS_OP_TEXT:
             # 服务器用 TEXT 帧发送 JSON 协议消息
             return self.WS_OP_TEXT, payload
 
-        # BINARY: 解包协议消息，如果失败则返回原始数据（可能是视频/RTP流）
-        msg_type, msg_payload, _ = HikProtocol.unpack_message(payload)
-        if msg_type is not None:
-            return msg_type, msg_payload
-        return self.WS_OP_BINARY, payload
+        # BINARY: 解不出协议头的部分当原始数据（可能是视频/RTP流）
+        messages = [(self.WS_OP_BINARY if msg_type is None else msg_type, msg_payload)
+                    for msg_type, msg_payload in hik_media.iter_messages(payload)]
+        if not messages:
+            # 空帧：没有任何消息可解，保持原有行为交给上层
+            return self.WS_OP_BINARY, payload
+        self._pending_messages.extend(messages[1:])
+        return messages[0]
 
     async def receive_message(self) -> tuple:
         """接收消息（阻塞）
@@ -533,8 +548,16 @@ class HikWebSocketClient:
         返回 (msg_type, payload)；连接关闭时返回 (None, None)。
         支持 WebSocket 分片帧（continuation）重组。
         """
-        while self.connected:
-            # 先尝试从 buffer 消费
+        while True:
+            # 消费顺序：排队的同帧后续消息 → buffer 里的 WS 帧 → socket。
+            # 顺序错了会乱序交付，甚至再次丢掉排在队里的消息。
+            if self._pending_messages:
+                return self._pending_messages.popleft()
+
+            if not self.connected:
+                break
+
+            # 再尝试从 buffer 消费
             while self.buffer:
                 opcode, payload, remaining, is_fin = self._parse_ws_frame(self.buffer)
                 if opcode is None:
