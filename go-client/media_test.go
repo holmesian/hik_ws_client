@@ -1,6 +1,7 @@
 package hikws
 
 import (
+	"bytes"
 	"encoding/hex"
 	"testing"
 )
@@ -93,7 +94,7 @@ func TestUnpack(t *testing.T) {
 func TestParseSDP_MediaInfoHeader(t *testing.T) {
 	hdr := make([]byte, 40)
 	copy(hdr[:4], "IMKH")
-	hdr[8] = 2  // container = PS
+	hdr[8] = 2 // container = PS
 	hdr[9] = 0
 	hdr[10] = 5 // codec = H265
 	hdr[11] = 0
@@ -185,12 +186,84 @@ func TestRecoverResolutionInStream(t *testing.T) {
 	au := append([]byte{0, 0, 0, 1}, sps...)
 	au = append(au, 0, 0, 1, 0x26 /* H265 TRAIL_R */, 0x01)
 
-	w2, h2, ok := recoverResolution(au, "H265")
+	w2, h2, _, ok := recoverResolution(au, "H265")
 	if !ok {
 		t.Fatal("recoverResolution returned ok=false")
 	}
 	if w2 != 1280 || h2 != 720 {
 		t.Fatalf("dims = %dx%d, want 1280x720", w2, h2)
+	}
+}
+
+// escapeNAL emulates an H.265 encoder: before writing a byte that would create
+// a 00 00 0x (x<=3) sequence, insert 0x03 after the two zeros.
+func escapeNAL(b []byte) []byte {
+	out := make([]byte, 0, len(b)+4)
+	for i := 0; i < len(b); i++ {
+		if i >= 2 && out[len(out)-1] == 0 && out[len(out)-2] == 0 && b[i] <= 3 {
+			out = append(out, 0x03)
+		}
+		out = append(out, b[i])
+	}
+	return out
+}
+
+// TestStripEmulationPrevention checks the byte-level EPB removal directly.
+func TestStripEmulationPrevention(t *testing.T) {
+	cases := []struct {
+		in  []byte
+		out []byte
+	}{
+		{[]byte{0x00, 0x00, 0x03, 0x00}, []byte{0x00, 0x00, 0x00}},
+		{[]byte{0x00, 0x00, 0x03, 0x01}, []byte{0x00, 0x00, 0x01}},
+		{[]byte{0x00, 0x00, 0x03, 0x02, 0x00, 0x00, 0x03, 0x03}, []byte{0x00, 0x00, 0x02, 0x00, 0x00, 0x03}},
+		{[]byte{0x01, 0x02, 0x03}, []byte{0x01, 0x02, 0x03}}, // no 00 00 prefix, unchanged
+	}
+	for _, c := range cases {
+		got := stripEmulationPrevention(c.in)
+		if !bytes.Equal(got, c.out) {
+			t.Errorf("stripEmulationPrevention(%x) = %x, want %x", c.in, got, c.out)
+		}
+	}
+}
+
+// TestParseH265SPS_EPB verifies a valid SPS whose RBSP naturally contains
+// 00 00 0x runs (the 32-bit profile-compatibility field is all zeros) still
+// decodes to the right resolution once the on-wire emulation-prevention bytes
+// are stripped. Without stripping, the 0x03 shifts every later field and the
+// resolution becomes garbage (the live stream reported 2x1 instead of 1280x720).
+func TestParseH265SPS_EPB(t *testing.T) {
+	w := &testBitWriter{}
+	w.putBits(0x42, 8)
+	w.putBits(0x01, 8)
+	w.putBits(0, 4)
+	w.putBits(0, 3)
+	w.putBits(1, 1)
+	w.putBits(0, 2)
+	w.putBits(0, 1)
+	w.putBits(1, 5)
+	w.putBits(0, 32) // general_profile_compatibility_flag: 4 zero bytes -> 00 00 00 00
+	w.putBits(0, 48)
+	w.putBits(93, 8)
+	w.putUE(0)
+	w.putUE(1)
+	w.putUE(1280)
+	w.putUE(720)
+	w.putBits(1, 1)
+	w.putUE(0)
+	w.putUE(0)
+	w.putUE(0)
+	w.putUE(0)
+
+	nal := w.bytes()          // valid 1280x720 SPS, no EPB yet
+	escaped := escapeNAL(nal) // on-wire form with 0x03 escapes
+
+	gotW, gotH, err := parseH265SPS(escaped)
+	if err != nil {
+		t.Fatalf("parseH265SPS with EPB: %v", err)
+	}
+	if gotW != 1280 || gotH != 720 {
+		t.Fatalf("dims with EPB = %dx%d, want 1280x720 (EPB not stripped?)", gotW, gotH)
 	}
 }
 

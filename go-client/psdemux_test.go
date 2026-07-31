@@ -10,19 +10,20 @@ func psPack() []byte {
 	return []byte{0x00, 0x00, 0x01, psPackStart, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 }
 
-// psVideoPES builds a video PES packet (stream_id 0xE0) carrying payload.
-// When pts>=0 a PTS is encoded into the PES header; otherwise the header is
-// empty. The returned slice is the whole PES packet including its start code.
+// psVideoPES builds a video PES packet (stream_id 0xE0) carrying payload,
+// with the standard 3-byte MPEG-2 PES optional header. When pts>=0 a PTS is
+// encoded; otherwise the optional header is empty. The returned slice is the
+// whole PES packet including its start code.
 func psVideoPES(payload []byte, pts int64) []byte {
 	flags := byte(0x00)
 	hdrLen := byte(0)
 	head := []byte{}
 	if pts >= 0 {
-		flags = 0x80 // PTS present
+		flags = 0x80 // PTS_DTS_flags = 0b10
 		hdrLen = 5
 		head = encodePTS(uint64(pts))
 	}
-	body := append([]byte{flags, hdrLen}, head...)
+	body := append([]byte{0x80, flags, hdrLen}, head...)
 	body = append(body, payload...)
 	pes := []byte{0x00, 0x00, 0x01, pesVideoFirst}
 	pes = append(pes, byte(len(body)>>8), byte(len(body)&0xff))
@@ -123,5 +124,74 @@ func TestPSDemux_Resync(t *testing.T) {
 	}
 	if !bytes.Equal(got[0].Data, idr) {
 		t.Fatalf("payload = %x, want %x", got[0].Data, idr)
+	}
+}
+
+// TestPSDemux_StandardPESHeader pins the on-the-wire PES layout with bytes
+// written out by hand, independently of psVideoPES. The MPEG-2 PES optional
+// header is three bytes; reading PES_header_data_length from the second byte
+// instead sees the 0x80 PTS flag as a 128-byte header, which chops the first
+// 128 bytes off every payload and decodes the PTS one byte early. Both
+// symptoms are invisible when the test helper shares the same mistake, so
+// this test hard-codes the real layout.
+func TestPSDemux_StandardPESHeader(t *testing.T) {
+	// 200 bytes of payload: long enough that a 128-byte over-skip truncates
+	// rather than dropping the packet outright.
+	payload := make([]byte, 200)
+	copy(payload, []byte{0x00, 0x00, 0x00, 0x01, 0x26, 0x01})
+	for i := 6; i < len(payload); i++ {
+		payload[i] = byte(i)
+	}
+	const wantPTS = int64(3600)
+
+	body := []byte{0x80, 0x80, 0x05} // marker/flags, PTS_DTS_flags=0b10, hdrLen=5
+	body = append(body, encodePTS(uint64(wantPTS))...)
+	body = append(body, payload...)
+	pes := []byte{0x00, 0x00, 0x01, pesVideoFirst, byte(len(body) >> 8), byte(len(body))}
+	pes = append(pes, body...)
+
+	d := &psDemuxer{}
+	var got []psFrame
+	got = append(got, d.Feed(append(psPack(), pes...))...)
+	got = append(got, d.Flush()...)
+
+	if len(got) != 1 {
+		t.Fatalf("frames = %d, want 1", len(got))
+	}
+	if !bytes.Equal(got[0].Data, payload) {
+		t.Fatalf("payload = %d bytes, want %d (PES header length misread)", len(got[0].Data), len(payload))
+	}
+	if !got[0].HasPTS || got[0].PTS != wantPTS {
+		t.Fatalf("PTS = %d (has=%v), want %d", got[0].PTS, got[0].HasPTS, wantPTS)
+	}
+}
+
+// TestPSDemux_PESWithDTS covers the PTS+DTS form (PTS_DTS_flags=0b11,
+// hdrLen=10): the frame PTS must still be the PTS field, and the extra DTS
+// bytes must not leak into the elementary stream.
+func TestPSDemux_PESWithDTS(t *testing.T) {
+	payload := []byte{0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0xAB}
+	const wantPTS = int64(7200)
+
+	body := []byte{0x80, 0xC0, 0x0A}
+	body = append(body, encodePTS(uint64(wantPTS))...)
+	body = append(body, encodePTS(uint64(wantPTS-1800))...) // DTS
+	body = append(body, payload...)
+	pes := []byte{0x00, 0x00, 0x01, pesVideoFirst, byte(len(body) >> 8), byte(len(body))}
+	pes = append(pes, body...)
+
+	d := &psDemuxer{}
+	var got []psFrame
+	got = append(got, d.Feed(append(psPack(), pes...))...)
+	got = append(got, d.Flush()...)
+
+	if len(got) != 1 {
+		t.Fatalf("frames = %d, want 1", len(got))
+	}
+	if !bytes.Equal(got[0].Data, payload) {
+		t.Fatalf("payload = %x, want %x (DTS leaked into the ES)", got[0].Data, payload)
+	}
+	if got[0].PTS != wantPTS {
+		t.Fatalf("PTS = %d, want %d", got[0].PTS, wantPTS)
 	}
 }

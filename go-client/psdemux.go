@@ -136,22 +136,30 @@ func (d *psDemuxer) closeAU() *psFrame {
 
 // appendPES strips the PES header and appends the payload to the current
 // access unit, taking the frame PTS from the first PES packet that carries one.
-// b is the bytes after the 6-byte start-code/length prefix, so b[0] is the
-// PES flags byte, b[1] the PES_header_data_length, and b[2:2+hlen] the
-// optional header data (PTS etc.), leaving b[2+hlen:] as the elementary stream.
+//
+// b is the bytes after the 6-byte start-code/length prefix. The MPEG-2 PES
+// optional header that follows is THREE bytes, not two:
+//
+//	b[0] '10' marker + scrambling/priority/alignment flags (0x80 typically)
+//	b[1] PTS_DTS_flags (bits 7-6) + ESCR/ES_rate/DSM/copy/CRC/ext flags
+//	b[2] PES_header_data_length, covering b[3:3+hlen] (PTS, DTS, ...)
+//
+// Reading the length from b[1] instead treats the 0x80 PTS flag as a
+// 128-byte header, which silently chopped the first 128 bytes off every PES
+// payload and decoded the PTS one byte early.
 func (d *psDemuxer) appendPES(b []byte) {
-	if len(b) < 2 {
+	if len(b) < 3 || b[0]&0xC0 != 0x80 {
 		return
 	}
-	hlen := int(b[1])
-	if len(b) < 2+hlen {
+	hlen := int(b[2])
+	if len(b) < 3+hlen {
 		return
 	}
-	// PTS_DTS_flags occupy bits 7-6 of b[0]; 0b10 means PTS only.
-	if b[0]&0x80 != 0 && hlen >= 5 && !d.hasPTS {
-		d.pts, d.hasPTS = readPTS(b[2:7]), true
+	// PTS_DTS_flags occupy bits 7-6 of b[1]; 0b10 = PTS only, 0b11 = PTS+DTS.
+	if b[1]&0x80 != 0 && hlen >= 5 && !d.hasPTS {
+		d.pts, d.hasPTS = readPTS(b[3:8]), true
 	}
-	d.au = append(d.au, b[2+hlen:]...)
+	d.au = append(d.au, b[3+hlen:]...)
 }
 
 // readPTS decodes the 33-bit PTS from the 5-byte PES timestamp field.

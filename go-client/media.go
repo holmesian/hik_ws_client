@@ -136,6 +136,26 @@ type bitReader struct {
 	pos  int // bit offset
 }
 
+// stripEmulationPrevention removes H.264/H.265 NAL emulation-prevention bytes:
+// a 0x03 that follows 00 00 in the escaped RBSP must be dropped before any
+// bit-level parsing. Without this, every field after the first 00 00 0x
+// sequence in the SPS is read at the wrong bit offset and the parsed resolution
+// is garbage (e.g. 2x1 instead of 1280x720). The encoder only ever inserts 03
+// after 00 00, so any 03 in that position is an EPB, never real data.
+func stripEmulationPrevention(b []byte) []byte {
+	if len(b) < 3 {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if i >= 2 && b[i] == 3 && b[i-1] == 0 && b[i-2] == 0 {
+			continue
+		}
+		out = append(out, b[i])
+	}
+	return out
+}
+
 func (b *bitReader) readBit() (int, error) {
 	byteIdx := b.pos / 8
 	if byteIdx >= len(b.data) {
@@ -210,8 +230,9 @@ func parseH264SPSBytes(raw []byte) (int, int, error) {
 	if len(raw) < 2 {
 		return 0, 0, fmt.Errorf("sps too short")
 	}
-	// Skip the 1-byte NAL header (forbidden_zero | nal_ref_idc | nal_unit_type).
-	br := &bitReader{data: raw[1:]}
+	// Skip the 1-byte NAL header, then strip emulation-prevention bytes before
+	// bit parsing.
+	br := &bitReader{data: stripEmulationPrevention(raw[1:])}
 
 	profileIdc, err := br.readBits(8)
 	if err != nil {
@@ -383,7 +404,9 @@ func parseH265SPS(raw []byte) (int, int, error) {
 	if len(raw) < 3 {
 		return 0, 0, fmt.Errorf("h265 sps too short")
 	}
-	br := &bitReader{data: raw[2:]} // skip the 2-byte HEVC NAL header
+	// Skip the 2-byte HEVC NAL header, then strip emulation-prevention bytes
+	// before bit parsing (a real SPS is full of 00 00 03 sequences).
+	br := &bitReader{data: stripEmulationPrevention(raw[2:])}
 
 	// sps_video_parameter_set_id u(4), sps_max_sub_layers_minus1 u(3),
 	// sps_temporal_id_nesting_flag u(1)
@@ -504,9 +527,11 @@ func parseH265SPS(raw []byte) (int, int, error) {
 // the SPS NAL unit and decodes its width/height. It returns ok=false when no
 // SPS is present or it cannot be parsed. The PS container delivers the stream
 // in annex-b form, so this recovers the resolution the MEDIAINFO header lacks.
-func recoverResolution(data []byte, codec string) (int, int, bool) {
+// On success sps holds the matched SPS NAL (including its start code and header)
+// so the caller can archive it for debugging.
+func recoverResolution(data []byte, codec string) (int, int, []byte, bool) {
 	if codec == "" {
-		return 0, 0, false
+		return 0, 0, nil, false
 	}
 	isH265 := codec == "H265"
 	spsType := byte(7) // H.264 SPS
@@ -532,19 +557,20 @@ func recoverResolution(data []byte, codec string) (int, int, bool) {
 			t = int(b & 0x1F)
 		}
 		if t == int(spsType) {
+			sps := data[pos:] // start code + NAL, the canonical unit to archive
 			if isH265 {
-				if w, h, err := parseH265SPS(data[nalPos:]); err == nil {
-					return w, h, true
+				if w, h, err := parseH265SPS(sps[3:]); err == nil {
+					return w, h, sps, true
 				}
 			} else {
-				if w, h, err := parseH264SPSBytes(data[nalPos:]); err == nil {
-					return w, h, true
+				if w, h, err := parseH264SPSBytes(sps[3:]); err == nil {
+					return w, h, sps, true
 				}
 			}
 		}
 		i = nalPos + 1
 	}
-	return 0, 0, false
+	return 0, 0, nil, false
 }
 
 // FrameMeta describes a single recovered video frame. The elementary
