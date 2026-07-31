@@ -31,6 +31,10 @@ type HikMediaClient struct {
 
 	// mediaInfo is recovered from the SDP the server returns on realplay.
 	mediaInfo *MediaInfo
+	// ps demuxes the MPEG-PS container the cameras actually send. It is
+	// allocated lazily on the first PS payload and stays nil for the raw
+	// elementary stream (RTP/RAW container) paths.
+	ps *psDemuxer
 	// frameCount / startTime drive the synthetic per-frame timestamp.
 	frameCount int
 	startTime  time.Time
@@ -41,6 +45,7 @@ type HikMediaClient struct {
 	OnError      func(error)              // transport / session errors
 	OnMediaInfo  func(*MediaInfo)         // SDP-like stream description (realplay)
 	OnVideoFrame func(*FrameMeta, []byte) // per-frame metadata + payload
+	OnRawVideo   func([]byte)             // raw container payload, before PS demux (diagnostics)
 
 	mu sync.Mutex
 }
@@ -135,15 +140,48 @@ func (c *HikMediaClient) Realplay() error {
 	return c.conn.WriteMessage(websocket.TextMessage, reqBytes)
 }
 
-// deliverVideo recovers the per-frame metadata and hands the payload to the
-// caller. Protocol-framed video (0x40) and raw binary frames both go through
-// here, so a caller that only registers OnVideoFrame receives every frame —
-// previously the raw path only fired OnVideoData and silently dropped frames
-// for OnVideoFrame-only consumers.
-//
-// OnVideoFrame takes precedence over OnVideoData to avoid delivering the same
-// payload twice; OnVideoData alone keeps working for existing callers.
-func (c *HikMediaClient) deliverVideo(data []byte) {
+// feedVideo routes a video payload to the caller. When the stream is an
+// MPEG-PS container (recovered from the SDP MEDIAINFO header, or detected
+// heuristically from a PS pack start), the payload is demuxed into access
+// units first — the device splits a single NAL across PES packets, so the
+// raw PS bytes cannot be scanned as annex-b. For every other container the
+// payload is delivered verbatim.
+func (c *HikMediaClient) feedVideo(data []byte) {
+	if c.OnRawVideo != nil {
+		c.OnRawVideo(data)
+	}
+	demux := false
+	if c.mediaInfo != nil && c.mediaInfo.Container == "PS" {
+		demux = true
+	} else if c.mediaInfo == nil && isPSData(data) {
+		demux = true
+	}
+	if !demux {
+		c.deliverFrame(data, 0, false)
+		return
+	}
+	if c.ps == nil {
+		c.ps = &psDemuxer{}
+	}
+	for _, f := range c.ps.Feed(data) {
+		c.deliverFrame(f.Data, f.PTS, f.HasPTS)
+	}
+}
+
+// isPSData reports whether b begins with an MPEG-PS pack header
+// (00 00 01 ba), used to demux streams whose SDP has not arrived yet.
+func isPSData(b []byte) bool {
+	return len(b) >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] == psPackStart
+}
+
+// deliverFrame recovers the per-frame metadata and hands the payload to the
+// caller. OnVideoFrame takes precedence over OnVideoData to avoid delivering
+// the same payload twice; OnVideoData alone keeps working for existing
+// callers. When hasPTS is true the container's real 90kHz PTS is used;
+// otherwise a synthetic, order-preserving PTS is synthesized from arrival
+// time. Resolution is recovered from an in-stream SPS when the MEDIAINFO
+// header (which carries none) left it unknown.
+func (c *HikMediaClient) deliverFrame(data []byte, pts int64, hasPTS bool) {
 	if c.OnVideoFrame == nil && c.OnVideoData == nil {
 		return
 	}
@@ -156,6 +194,16 @@ func (c *HikMediaClient) deliverVideo(data []byte) {
 	if c.mediaInfo != nil {
 		codec = c.mediaInfo.Codec
 	}
+	// Recover resolution from the in-stream SPS (the MEDIAINFO header has
+	// none). This fills Width/Height for PS streams on the first key frame.
+	if codec != "" && (c.mediaInfo == nil || c.mediaInfo.Width == 0) {
+		if w, h, ok := recoverResolution(data, codec); ok {
+			if c.mediaInfo != nil {
+				c.mediaInfo.Width, c.mediaInfo.Height = w, h
+			}
+		}
+	}
+
 	elapsed := time.Since(c.startTime)
 	meta := &FrameMeta{
 		FrameIndex:  c.frameCount,
@@ -163,11 +211,14 @@ func (c *HikMediaClient) deliverVideo(data []byte) {
 		Codec:       codec,
 		TimestampMs: elapsed.Milliseconds(),
 	}
+	if hasPTS {
+		meta.PTS = pts
+		meta.HasPTS = true
+	} else if c.mediaInfo != nil && c.mediaInfo.ClockRate > 0 {
+		meta.PTS = int64(elapsed.Seconds() * float64(c.mediaInfo.ClockRate))
+	}
 	if c.mediaInfo != nil {
 		meta.Width, meta.Height = c.mediaInfo.Width, c.mediaInfo.Height
-		if c.mediaInfo.ClockRate > 0 {
-			meta.PTS = int64(elapsed.Seconds() * float64(c.mediaInfo.ClockRate))
-		}
 	}
 	if c.Config.Verbose {
 		log.Printf("Video frame #%d: %d bytes (key=%v, codec=%s)", meta.FrameIndex, len(data), meta.IsKeyFrame, codec)
@@ -178,6 +229,17 @@ func (c *HikMediaClient) deliverVideo(data []byte) {
 		return
 	}
 	c.OnVideoData(data)
+}
+
+// flushPS delivers the last access unit still buffered in the demuxer,
+// which closes on stream end (see psDemuxer.Flush).
+func (c *HikMediaClient) flushPS() {
+	if c.ps == nil {
+		return
+	}
+	for _, f := range c.ps.Flush() {
+		c.deliverFrame(f.Data, f.PTS, f.HasPTS)
+	}
 }
 
 // Run processes incoming messages until context is cancelled or connection drops.
@@ -199,6 +261,8 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 	conn := c.conn
 	done := make(chan struct{})
 	defer close(done)
+	// Flush the final buffered access unit when the stream ends.
+	defer c.flushPS()
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -277,14 +341,14 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					if c.Config.Verbose {
 						log.Printf("Raw video frame: %d bytes", len(buf))
 					}
-					c.deliverVideo(buf)
+					c.feedVideo(buf)
 					break
 				}
 
 				pType, pData := msg.Type, msg.Payload
 				switch pType {
 				case MsgTypeVideoData:
-					c.deliverVideo(pData)
+					c.feedVideo(pData)
 				case MsgTypeAudioData:
 					if c.OnAudioData != nil {
 						c.OnAudioData(pData)

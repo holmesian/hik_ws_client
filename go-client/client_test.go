@@ -2,6 +2,7 @@ package hikws
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -397,5 +398,181 @@ func TestIntegration_Keepalive(t *testing.T) {
 	case <-pinged:
 	case <-time.After(2 * time.Second):
 		t.Fatal("no keepalive ping received")
+	}
+}
+
+// hevcSPS builds a minimal but valid HEVC SPS NAL (2-byte NAL header + RBSP)
+// carrying the given luma resolution, used by the PS/H.265 integration test.
+func hevcSPS(w, h int) []byte {
+	tw := &testBitWriter{}
+	tw.putBits(0x42, 8) // NAL header byte 0 (type 33 = SPS_NUT)
+	tw.putBits(0x01, 8) // NAL header byte 1
+	tw.putBits(0, 4)    // sps_video_parameter_set_id
+	tw.putBits(0, 3)    // sps_max_sub_layers_minus1
+	tw.putBits(1, 1)    // sps_temporal_id_nesting_flag
+	tw.putBits(0, 2)    // general_profile_space
+	tw.putBits(0, 1)    // general_tier_flag
+	tw.putBits(1, 5)    // general_profile_idc
+	tw.putBits(0, 32)   // general_profile_compatibility_flag
+	tw.putBits(0, 48)   // general_constraint_indicator_flag
+	tw.putBits(93, 8)   // general_level_idc
+	tw.putUE(0)         // sps_seq_parameter_set_id
+	tw.putUE(1)         // chroma_format_idc
+	tw.putUE(w)         // pic_width_in_luma_samples
+	tw.putUE(h)         // pic_height_in_luma_samples
+	tw.putBits(1, 1)    // conformance_window_flag
+	tw.putUE(0)
+	tw.putUE(0)
+	tw.putUE(0)
+	tw.putUE(0)
+	return tw.bytes()
+}
+
+// TestIntegration_PS_H265 exercises the whole recovery path against a stream
+// that is what the Hikvision cameras actually emit: an MPEG-PS container
+// (not annex-b) carrying HEVC with the codec/container declared only in the
+// SDP MEDIAINFO header, and resolution discoverable solely from the in-stream
+// SPS. It asserts the client demuxes PS into access units, recovers the
+// H.265 SPS resolution, reports the correct keyframe/PTS/frame-count, and
+// delivers the original elementary stream to the caller.
+func TestIntegration_PS_H265(t *testing.T) {
+	// SDP with a MEDIAINFO header declaring PS container + H265 codec.
+	hdr := make([]byte, 40)
+	copy(hdr[:4], "IMKH")
+	hdr[8] = 2  // container = PS
+	hdr[10] = 5 // codec = H265
+	sdp := "v=0\nm=video 0 RTP/AVP 0\na=rtpmap:0 /0\n" +
+		"a=Media_header:MEDIAINFO=" + hex.EncodeToString(hdr) + ";\n"
+
+	const (
+		frames   = 10
+		width    = 1280
+		height   = 720
+		keyEvery = 10 // first frame is an IDR, rest are TRAIL_R
+	)
+	sps := hevcSPS(width, height)
+	vps := []byte{0, 0, 0, 1, 0x40, 0x01, 0x00}
+	pps := []byte{0, 0, 0, 1, 0x44, 0x01, 0x00}
+
+	var chunks [][]byte
+	for i := 0; i < frames; i++ {
+		au := append([]byte(nil), vps...)
+		au = append(au, []byte{0, 0, 0, 1}...)
+		au = append(au, sps...)
+		au = append(au, pps...)
+		if i == 0 {
+			au = append(au, []byte{0, 0, 0, 1, 0x26, 0x01, 0x02}...) // IDR_W_DLP
+		} else {
+			au = append(au, []byte{0, 0, 0, 1, 0x02, 0x01, 0x03}...) // TRAIL_R
+		}
+		// 25fps @ 90kHz => 3600 ticks per frame.
+		pts := int64(i * 3600)
+		chunks = append(chunks, append(psPack(), psVideoPES(au, pts)...))
+	}
+
+	cfg := startMock(t, func(t *testing.T, conn *websocket.Conn) {
+		sendAuth(t, conn)
+		expectRealplay(t, conn)
+		_ = conn.WriteJSON(map[string]interface{}{"errorCode": 0, "sdp": sdp})
+		for _, ch := range chunks {
+			_ = conn.WriteMessage(websocket.BinaryMessage, PackMessage(MsgTypeVideoData, ch))
+		}
+		_ = conn.WriteMessage(websocket.BinaryMessage, PackMessage(MsgTypeSessionError, []byte("done")))
+		time.Sleep(200 * time.Millisecond)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := connectAndPlay(t, cfg, ctx)
+
+	var (
+		mu       sync.Mutex
+		info     *MediaInfo
+		metas    []*FrameMeta
+		sizes    []int
+		gotPTS   []int64
+		errs     []error
+		framesCh = make(chan struct{}, 32)
+	)
+	c.OnMediaInfo = func(mi *MediaInfo) { mu.Lock(); info = mi; mu.Unlock() }
+	c.OnVideoFrame = func(m *FrameMeta, data []byte) {
+		mu.Lock()
+		metas = append(metas, m)
+		sizes = append(sizes, len(data))
+		if m.HasPTS {
+			gotPTS = append(gotPTS, m.PTS)
+		}
+		mu.Unlock()
+		framesCh <- struct{}{}
+	}
+	c.OnError = func(e error) { mu.Lock(); errs = append(errs, e); mu.Unlock() }
+
+	done := make(chan struct{})
+	go func() { c.Run(ctx); close(done) }()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("Run did not return after session error")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if info == nil {
+		t.Fatal("OnMediaInfo never fired")
+	}
+	if info.Container != "PS" || info.Codec != "H265" {
+		t.Fatalf("media info = container %q codec %q, want PS/H265", info.Container, info.Codec)
+	}
+	if info.ClockRate != 90000 {
+		t.Fatalf("clock rate = %d, want 90000", info.ClockRate)
+	}
+	// Resolution is NOT in the MEDIAINFO header; it must be recovered from
+	// the in-stream SPS. If this is 0, the SPS recovery path is broken.
+	if info.Width != width || info.Height != height {
+		t.Fatalf("recovered resolution = %dx%d, want %dx%d", info.Width, info.Height, width, height)
+	}
+
+	if len(metas) != frames {
+		t.Fatalf("frames = %d, want %d", len(metas), frames)
+	}
+	keyCount := 0
+	for i, m := range metas {
+		if m.IsKeyFrame {
+			keyCount++
+		}
+		if m.Codec != "H265" {
+			t.Errorf("frame %d: codec = %q, want H265", i, m.Codec)
+		}
+		if m.Width != width || m.Height != height {
+			t.Errorf("frame %d: dims = %dx%d, want %dx%d", i, m.Width, m.Height, width, height)
+		}
+		if !m.HasPTS {
+			t.Errorf("frame %d: HasPTS = false, want true (PS carries PTS)", i)
+		}
+		// The delivered payload must be the demuxed elementary stream, not the
+		// raw PS bytes; it must be a plausible NAL-bearing access unit.
+		if sizes[i] < 7 {
+			t.Errorf("frame %d: implausibly small payload %d bytes", i, sizes[i])
+		}
+	}
+	if keyCount != 1 {
+		t.Fatalf("keyframes = %d, want 1 (only the IDR)", keyCount)
+	}
+
+	// PTS must be the real container PTS, monotonically increasing by 3600.
+	if len(gotPTS) != frames {
+		t.Fatalf("PTS frames = %d, want %d", len(gotPTS), frames)
+	}
+	for i := 1; i < len(gotPTS); i++ {
+		if gotPTS[i]-gotPTS[i-1] != 3600 {
+			t.Fatalf("PTS delta at %d = %d, want 3600 (25fps @ 90kHz)", i, gotPTS[i]-gotPTS[i-1])
+		}
+	}
+
+	// The only error should be the terminating session error.
+	if len(errs) != 1 {
+		t.Fatalf("errors = %v, want the single session error", errs)
 	}
 }

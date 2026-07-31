@@ -1,6 +1,9 @@
 package hikws
 
-import "testing"
+import (
+	"encoding/hex"
+	"testing"
+)
 
 func TestParseSDP_H264(t *testing.T) {
 	sdp := "v=0\no=- 0 0 IN IP4 0.0.0.0\ns=Session streamed by Hikvision\n" +
@@ -82,3 +85,150 @@ func TestUnpack(t *testing.T) {
 		t.Fatalf("remaining = %v", msg.Remaining)
 	}
 }
+
+// TestParseSDP_MediaInfoHeader verifies the Hikvision MEDIAINFO header (carried
+// in a=Media_header:MEDIAINFO=<hex>) overrides rtpmap and sets the container
+// and codec. The cameras send this instead of sprop-parameter-sets, so the
+// resolution stays 0 until an in-stream SPS is seen.
+func TestParseSDP_MediaInfoHeader(t *testing.T) {
+	hdr := make([]byte, 40)
+	copy(hdr[:4], "IMKH")
+	hdr[8] = 2  // container = PS
+	hdr[9] = 0
+	hdr[10] = 5 // codec = H265
+	hdr[11] = 0
+	hexHdr := hex.EncodeToString(hdr)
+
+	sdp := "v=0\no=- 0 0 IN IP4 0.0.0.0\ns=Session streamed by Hikvision\n" +
+		"m=video 0 RTP/AVP 0\na=rtpmap:0 /0\n" +
+		"a=Media_header:MEDIAINFO=" + hexHdr + ";\n"
+
+	info := ParseSDP(sdp)
+	if info.Container != "PS" {
+		t.Fatalf("container = %q, want PS", info.Container)
+	}
+	if info.Codec != "H265" {
+		t.Fatalf("codec = %q, want H265", info.Codec)
+	}
+	if info.ClockRate != 90000 {
+		t.Fatalf("clock = %d, want 90000 (PS default)", info.ClockRate)
+	}
+	if info.Width != 0 || info.Height != 0 {
+		t.Fatalf("dims = %dx%d, want 0x0 (MEDIAINFO has no resolution)", info.Width, info.Height)
+	}
+}
+
+// TestParseH265SPS decodes a hand-built HEVC SPS and checks the recovered
+// resolution. Resolution is what the MEDIAINFO header lacks, so this is the
+// path that fills Width/Height for a PS/H265 stream.
+func TestParseH265SPS(t *testing.T) {
+	// Build an SPS NAL (2-byte NAL header + RBSP) with 1920x1080, chroma 1,
+	// no conformance cropping.
+	w := &testBitWriter{}
+	w.putBits(0x42, 8) // NAL header byte 0
+	w.putBits(0x01, 8) // NAL header byte 1 (type 33 = SPS_NUT)
+	w.putBits(0, 4)    // sps_video_parameter_set_id
+	w.putBits(0, 3)    // sps_max_sub_layers_minus1
+	w.putBits(1, 1)    // sps_temporal_id_nesting_flag
+	w.putBits(0, 2)    // general_profile_space
+	w.putBits(0, 1)    // general_tier_flag
+	w.putBits(1, 5)    // general_profile_idc
+	w.putBits(0, 32)   // general_profile_compatibility_flag
+	w.putBits(0, 48)   // general_constraint_indicator_flag
+	w.putBits(93, 8)   // general_level_idc
+	w.putUE(0)         // sps_seq_parameter_set_id
+	w.putUE(1)         // chroma_format_idc
+	w.putUE(1920)      // pic_width_in_luma_samples
+	w.putUE(1080)      // pic_height_in_luma_samples
+	w.putBits(1, 1)    // conformance_window_flag
+	w.putUE(0)         // conf_win_left_offset
+	w.putUE(0)         // conf_win_right_offset
+	w.putUE(0)         // conf_win_top_offset
+	w.putUE(0)         // conf_win_bottom_offset
+
+	gotW, gotH, err := parseH265SPS(w.bytes())
+	if err != nil {
+		t.Fatalf("parseH265SPS: %v", err)
+	}
+	if gotW != 1920 || gotH != 1080 {
+		t.Fatalf("dims = %dx%d, want 1920x1080", gotW, gotH)
+	}
+}
+
+// TestRecoverResolutionInStream verifies an SPS NAL inside an access unit fills
+// the resolution, which is how a PS/H265 stream (no sprop in SDP) gets sized.
+func TestRecoverResolutionInStream(t *testing.T) {
+	w := &testBitWriter{}
+	w.putBits(0x42, 8)
+	w.putBits(0x01, 8)
+	w.putBits(0, 4)
+	w.putBits(0, 3)
+	w.putBits(1, 1)
+	w.putBits(0, 2)
+	w.putBits(0, 1)
+	w.putBits(1, 5)
+	w.putBits(0, 32)
+	w.putBits(0, 48)
+	w.putBits(93, 8)
+	w.putUE(0)
+	w.putUE(1)
+	w.putUE(1280)
+	w.putUE(720)
+	w.putBits(1, 1)
+	w.putUE(0)
+	w.putUE(0)
+	w.putUE(0)
+	w.putUE(0)
+	sps := w.bytes()
+
+	// AU = SPS NAL (start code + NAL) then a slice NAL.
+	au := append([]byte{0, 0, 0, 1}, sps...)
+	au = append(au, 0, 0, 1, 0x26 /* H265 TRAIL_R */, 0x01)
+
+	w2, h2, ok := recoverResolution(au, "H265")
+	if !ok {
+		t.Fatal("recoverResolution returned ok=false")
+	}
+	if w2 != 1280 || h2 != 720 {
+		t.Fatalf("dims = %dx%d, want 1280x720", w2, h2)
+	}
+}
+
+// testBitWriter is a helper for the SPS encoding tests above.
+type testBitWriter struct {
+	buf   []byte
+	nbits int
+}
+
+func (w *testBitWriter) putBit(b int) {
+	idx := w.nbits / 8
+	if idx >= len(w.buf) {
+		w.buf = append(w.buf, 0)
+	}
+	if b == 1 {
+		w.buf[idx] |= byte(1) << (7 - (w.nbits % 8))
+	}
+	w.nbits++
+}
+
+func (w *testBitWriter) putBits(v uint64, n int) {
+	for i := n - 1; i >= 0; i-- {
+		w.putBit(int((v >> uint(i)) & 1))
+	}
+}
+
+func (w *testBitWriter) putUE(v int) {
+	val := uint64(v + 1)
+	bits := 0
+	for tmp := val; tmp > 0; tmp >>= 1 {
+		bits++
+	}
+	for i := 0; i < bits-1; i++ {
+		w.putBit(0)
+	}
+	for i := bits - 1; i >= 0; i-- {
+		w.putBit(int((val >> uint(i)) & 1))
+	}
+}
+
+func (w *testBitWriter) bytes() []byte { return w.buf }
