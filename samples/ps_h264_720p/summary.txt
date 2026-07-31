@@ -1,0 +1,11 @@
+==== probe summary ====
+container   : PS
+codec       : H264
+clockRate   : 90000
+resolution  : 1280x720
+frames      : 655
+keyframes   : 26
+rawBytes    : 4053224
+esBytes     : 3804734
+pts         : 655 frames, 679651402..681911761 (2260359 ticks @90000Hz => 26.04 fps)
+=======================

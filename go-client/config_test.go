@@ -15,10 +15,10 @@ func TestParseProxyURL(t *testing.T) {
 		{
 			name: "ipv6 with port and base64 password",
 			// base64("mYqWpMI") has no ':' → whole value is the password
-			url:        "wss://example.com:6014/proxy/[fd00:0:2c0:9::10c]:559/openUrl/bVlxV3BNSQ==",
+			url:        "wss://example.com:6014/proxy/[fd00::10c]:559/openUrl/bVlxV3BNSQ==",
 			host:       "example.com",
 			port:       6014,
-			deviceIP:   "[fd00:0:2c0:9::10c]",
+			deviceIP:   "[fd00::10c]",
 			devicePort: 559,
 			user:       "admin",
 			password:   "mYqWpMI",

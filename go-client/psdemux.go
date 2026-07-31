@@ -39,6 +39,7 @@ type psDemuxer struct {
 	au     []byte
 	pts    int64
 	hasPTS bool
+	synced bool // a pack header has been seen; before that we are mid-frame
 }
 
 // Feed consumes a chunk of PS bytes and returns the access units it
@@ -90,7 +91,9 @@ func (d *psDemuxer) step(b []byte) (int, *psFrame, bool) {
 		if len(b) < n {
 			return 0, nil, false
 		}
-		return n, d.closeAU(), true
+		f := d.closeAU()
+		d.synced = true
+		return n, f, true
 
 	case sid >= psSystemStart:
 		// System header, program stream map and every PES packet share the
@@ -148,6 +151,14 @@ func (d *psDemuxer) closeAU() *psFrame {
 // 128-byte header, which silently chopped the first 128 bytes off every PES
 // payload and decoded the PTS one byte early.
 func (d *psDemuxer) appendPES(b []byte) {
+	// A live stream is joined at an arbitrary point, so the PES packets that
+	// arrive before the first pack header are the tail of an access unit whose
+	// beginning we never saw. Measured on 42 cameras: 7 of them start that way,
+	// once with 151KiB of a key frame's tail — emitting it produces one
+	// undecodable frame with no PTS at the head of every such session.
+	if !d.synced {
+		return
+	}
 	if len(b) < 3 || b[0]&0xC0 != 0x80 {
 		return
 	}

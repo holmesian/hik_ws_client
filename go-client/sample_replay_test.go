@@ -2,31 +2,75 @@ package hikws
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// strictWalkPS walks an MPEG-PS stream element by element without ever
+// resyncing: each element must begin exactly where the previous one ended. It
+// returns the number of elements consumed and the offset it derailed at, or -1
+// when it reached the end of the buffer cleanly.
+//
+// This is deliberately stricter than psDemuxer, which scans forward for the
+// next pack header. That scan makes the demuxer robust against packet loss —
+// and makes packet loss invisible, because the frame counts still come out
+// right. Only a non-resyncing walk can tell a whole stream from a holed one.
+func strictWalkPS(b []byte) (int, int) {
+	i, n := 0, 0
+	for i < len(b) {
+		if i+4 > len(b) || b[i] != 0 || b[i+1] != 0 || b[i+2] != 1 {
+			return n, i
+		}
+		var size int
+		switch id := b[i+3]; {
+		case id == 0xBA: // pack header: 14 bytes + stuffing
+			if i+14 > len(b) {
+				return n, i
+			}
+			size = 14 + int(b[i+13]&7)
+		case id == 0xB9: // program end
+			size = 4
+		default: // system header, PSM, PES — all length-prefixed
+			if i+6 > len(b) {
+				return n, i
+			}
+			size = 6 + int(binary.BigEndian.Uint16(b[i+4:i+6]))
+		}
+		if i+size > len(b) {
+			return n, i
+		}
+		i += size
+		n++
+	}
+	return n, -1
+}
 
 // samples lists the archived real-device captures. They are the whole reason
 // they were collected: synthetic tests only prove the parser is
 // self-consistent, while these replay bytes real cameras actually sent.
 var samples = []struct {
 	dir           string
+	codec         string
 	frames, keys  int
 	width, height int
+	spsNAL        int // NAL type of the SPS recoverResolution must return
 }{
-	{dir: "../samples/ps_h265_720p", frames: 611, keys: 25, width: 1280, height: 720},
-	{dir: "../samples/ps_h265_1080p", frames: 614, keys: 13, width: 1920, height: 1080},
+	{dir: "../samples/ps_h265_720p", codec: "H265", frames: 611, keys: 25, width: 1280, height: 720, spsNAL: 33},
+	{dir: "../samples/ps_h265_1080p", codec: "H265", frames: 614, keys: 13, width: 1920, height: 1080, spsNAL: 33},
+	{dir: "../samples/ps_h264_720p", codec: "H264", frames: 655, keys: 26, width: 1280, height: 720, spsNAL: 7},
 }
 
-// TestReplaySamples_PS_H265 replays each archived MPEG-PS/H.265 capture
-// through the demuxer and asserts the properties measured on the live link.
+// TestReplaySamples replays each archived MPEG-PS capture through the demuxer
+// and asserts the properties measured on the live link.
 //
-// The two bugs this repo has hit — a misread PES header length and an
-// unstripped SPS emulation-prevention byte — both left frame counts and
-// keyframe counts looking perfectly normal while corrupting the payload. So
-// this checks the payload structure, not just the tallies.
-func TestReplaySamples_PS_H265(t *testing.T) {
+// Every parser bug this repo has hit — a misread PES header length, an
+// unstripped SPS emulation-prevention byte, RTP headers left inside the
+// payload — left frame counts and keyframe counts looking perfectly normal
+// while corrupting the bitstream. So this checks the payload structure, not
+// just the tallies.
+func TestReplaySamples(t *testing.T) {
 	for _, s := range samples {
 		t.Run(filepath.Base(s.dir), func(t *testing.T) {
 			path := filepath.Join(s.dir, "stream.ps")
@@ -36,6 +80,16 @@ func TestReplaySamples_PS_H265(t *testing.T) {
 					t.Skipf("sample %s not present", path)
 				}
 				t.Fatal(err)
+			}
+
+			// Structure first. The demuxer resyncs on the next pack header,
+			// so it happily produces the right number of frames from a
+			// stream that has bytes missing or transport headers spliced in
+			// — that is how RTP de-encapsulation bugs stayed invisible in
+			// both directions. A strict walk does not resync: every element
+			// must begin exactly where the previous one ended.
+			if n, derail := strictWalkPS(raw); derail >= 0 {
+				t.Fatalf("strict PS walk derailed at %d/%d after %d elements", derail, len(raw), n)
 			}
 
 			// Feed in 16KiB chunks so access units are split across calls the
@@ -58,7 +112,7 @@ func TestReplaySamples_PS_H265(t *testing.T) {
 			keys, withPTS := 0, 0
 			var prevPTS int64
 			for i, f := range frames {
-				if AnalyzeFrame(f.Data, "H265") {
+				if AnalyzeFrame(f.Data, s.codec) {
 					keys++
 				}
 				if f.HasPTS {
@@ -87,7 +141,7 @@ func TestReplaySamples_PS_H265(t *testing.T) {
 			var gotW, gotH int
 			var sps []byte
 			for _, f := range frames {
-				if w, h, sp, ok := recoverResolution(f.Data, "H265"); ok {
+				if w, h, sp, ok := recoverResolution(f.Data, s.codec); ok {
 					gotW, gotH, sps = w, h, sp
 					break
 				}
@@ -101,8 +155,12 @@ func TestReplaySamples_PS_H265(t *testing.T) {
 			}
 			// sps starts at the 3-byte start code recoverResolution matched, so
 			// the NAL header byte is at index 3 regardless of start code length.
-			if got := int(sps[3]>>1) & 0x3F; got != 33 {
-				t.Errorf("recovered NAL type = %d, want 33 (SPS_NUT)", got)
+			got := int(sps[3]) & 0x1F
+			if s.codec == "H265" {
+				got = int(sps[3]>>1) & 0x3F
+			}
+			if got != s.spsNAL {
+				t.Errorf("recovered NAL type = %d, want %d (SPS)", got, s.spsNAL)
 			}
 		})
 	}

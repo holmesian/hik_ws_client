@@ -52,9 +52,13 @@ type HikMediaClient struct {
 	// mediaInfo is recovered from the SDP the server returns on realplay.
 	mediaInfo *MediaInfo
 	// ps demuxes the MPEG-PS container the cameras actually send. It is
-	// allocated lazily on the first PS payload and stays nil for the raw
-	// elementary stream (RTP/RAW container) paths.
-	ps *psDemuxer
+	// allocated on the first payload and stays nil for the bare elementary
+	// stream paths; containerKnown records that the choice has been made.
+	ps             *psDemuxer
+	containerKnown bool
+	// rtp classifies the session's transport once, before the container is
+	// looked at; some proxies tunnel the container inside RTP.
+	rtp rtpDetector
 	// frameCount / startTime drive the synthetic per-frame timestamp.
 	frameCount int
 	startTime  time.Time
@@ -203,28 +207,39 @@ func (c *HikMediaClient) dispatch(e streamEvent) {
 	}
 }
 
-// feedVideo routes a video payload to the caller. When the stream is an
-// MPEG-PS container (recovered from the SDP MEDIAINFO header, or detected
-// heuristically from a PS pack start), the payload is demuxed into access
-// units first — the device splits a single NAL across PES packets, so the
-// raw PS bytes cannot be scanned as annex-b. For every other container the
-// payload is delivered verbatim.
+// feedVideo routes a video payload to the caller. The RTP detector may hold
+// the first message back until it can classify the session, so one call can
+// release zero, one or two payloads.
 func (c *HikMediaClient) feedVideo(data []byte) {
+	for _, p := range c.rtp.feed(data) {
+		c.feedContainer(p)
+	}
+}
+
+// feedContainer handles one de-encapsulated payload. When the stream is an
+// MPEG-PS container it is demuxed into access units — the device splits a
+// single NAL across PES packets, so raw PS bytes cannot be scanned as
+// annex-b. For every other container the payload is delivered verbatim.
+func (c *HikMediaClient) feedContainer(data []byte) {
 	if c.OnRawVideo != nil {
 		c.OnRawVideo(data)
 	}
-	demux := false
-	if c.mediaInfo != nil && c.mediaInfo.Container == "PS" {
-		demux = true
-	} else if c.mediaInfo == nil && isPSData(data) {
-		demux = true
-	}
-	if !demux {
-		c.deliverFrame(data, 0, false)
-		return
+	// Decide the container once per session, from the first payload. The
+	// MEDIAINFO header is a hint, not the truth: one camera family sends a
+	// header this client cannot decode (magic "HVAG" rather than "IMKH"),
+	// which leaves Container empty even though the payload is plainly
+	// MPEG-PS. Sniffing settles it — but only on the first message, because
+	// later ones carry PES continuations that start mid-pack.
+	if !c.containerKnown {
+		c.containerKnown = true
+		if (c.mediaInfo != nil && c.mediaInfo.Container == "PS") ||
+			((c.mediaInfo == nil || c.mediaInfo.Container == "") && isPSData(data)) {
+			c.ps = &psDemuxer{}
+		}
 	}
 	if c.ps == nil {
-		c.ps = &psDemuxer{}
+		c.deliverFrame(data, 0, false)
+		return
 	}
 	for _, f := range c.ps.Feed(data) {
 		c.deliverFrame(f.Data, f.PTS, f.HasPTS)
@@ -256,6 +271,14 @@ func (c *HikMediaClient) deliverFrame(data []byte, pts int64, hasPTS bool) {
 	codec := ""
 	if c.mediaInfo != nil {
 		codec = c.mediaInfo.Codec
+	}
+	// Same reason as the container: a MEDIAINFO header this client cannot
+	// decode leaves the codec blank, and without one there is no key frame
+	// flag and no resolution. The bitstream says which codec it is.
+	if codec == "" {
+		if codec = sniffCodec(data); codec != "" && c.mediaInfo != nil {
+			c.mediaInfo.Codec = codec
+		}
 	}
 	// Recover resolution from the in-stream SPS (the MEDIAINFO header has
 	// none). This fills Width/Height for PS streams on the first key frame.
@@ -297,9 +320,14 @@ func (c *HikMediaClient) deliverFrame(data []byte, pts int64, hasPTS bool) {
 	c.OnVideoData(data)
 }
 
-// flushPS delivers the last access unit still buffered in the demuxer,
-// which closes on stream end (see psDemuxer.Flush).
+// flushPS releases anything still buffered when the stream ends: a payload the
+// RTP detector was holding for classification, then the last access unit in
+// the demuxer (see psDemuxer.Flush). Order matters — the held payload has to
+// reach the demuxer before the demuxer is closed.
 func (c *HikMediaClient) flushPS() {
+	for _, p := range c.rtp.flush() {
+		c.feedContainer(p)
+	}
 	if c.ps == nil {
 		return
 	}
@@ -370,7 +398,7 @@ func (c *HikMediaClient) session(ctx context.Context) error {
 	// A new session brings a new SDP and a fresh container; whatever the
 	// dead connection left half-demuxed must not be spliced onto it.
 	c.mediaInfo = nil
-	c.ps = nil
+	c.ps, c.containerKnown, c.rtp = nil, false, rtpDetector{}
 	return c.run(ctx)
 }
 

@@ -195,3 +195,32 @@ func TestPSDemux_PESWithDTS(t *testing.T) {
 		t.Fatalf("PTS = %d, want %d", got[0].PTS, wantPTS)
 	}
 }
+
+// TestPSDemux_DropsPartialLeadingAU pins what happens when a live stream is
+// joined mid-frame, which is the normal case: the session starts wherever the
+// camera happens to be. The PES packets arriving before the first pack header
+// are the tail of an access unit whose head was sent before we connected, so
+// they must be dropped, not emitted as a frame. Measured on 42 cameras, 7
+// begin this way — one with 151KiB of a key frame's tail.
+func TestPSDemux_DropsPartialLeadingAU(t *testing.T) {
+	tail := []byte{0x9A, 0x77, 0x01, 0x23} // mid-NAL bytes, no start code
+	full := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x42}
+
+	d := &psDemuxer{}
+	var got []psFrame
+	got = append(got, d.Feed(psVideoPES(tail, 3600))...) // joined mid-frame
+	got = append(got, d.Feed(append(psPack(), psVideoPES(full, 7200)...))...)
+	got = append(got, d.Flush()...)
+
+	if len(got) != 1 {
+		t.Fatalf("frames = %d, want 1 (the partial leading AU must be dropped)", len(got))
+	}
+	if !bytes.Equal(got[0].Data, full) {
+		t.Fatalf("payload = %x, want %x", got[0].Data, full)
+	}
+	// The dropped tail carried a PTS of its own; taking it would date the
+	// first real frame 40ms early.
+	if got[0].PTS != 7200 {
+		t.Fatalf("PTS = %d, want 7200 (PTS leaked from the dropped tail)", got[0].PTS)
+	}
+}

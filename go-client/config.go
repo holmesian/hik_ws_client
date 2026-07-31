@@ -47,7 +47,7 @@ type HikConfig struct {
 }
 
 // ParseProxyURL parses a Hikvision proxy URL to extract the configuration.
-// Example: wss://example.com:6014/proxy/[fd00:0:2c0:9::10c]:559/openUrl/mYqWpMI
+// Example: wss://example.com:6014/proxy/[fd00::10c]:559/openUrl/<token>
 func ParseProxyURL(proxyURL string) (*HikConfig, error) {
 	u, err := url.Parse(proxyURL)
 	if err != nil {

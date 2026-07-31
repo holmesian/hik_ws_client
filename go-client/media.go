@@ -604,6 +604,45 @@ type FrameMeta struct {
 	TimestampMs int64 // wall-clock ms since stream start
 }
 
+// sniffCodec identifies the video codec from the NAL headers of an annex-b
+// access unit, for the streams whose MEDIAINFO header this client cannot
+// decode. It returns "H264", "H265", or "" when the unit carries nothing
+// conclusive — callers should keep trying on later access units.
+//
+// It keys on the parameter sets, which both codecs resend ahead of every key
+// frame, because those are the NAL headers whose two readings do not collide
+// in practice:
+//
+//   - H.265 has a two-byte header, forbidden_zero(1) type(6) layer(6) tid(3);
+//     VPS/SPS/PPS are types 32/33/34 at layer 0, so the first byte reads
+//     0x40/0x42/0x44. Read as H.264 those are types 0/2/4 — "unspecified" and
+//     the two slice data partitions, which no camera profile emits.
+//   - H.264 has a one-byte header, forbidden_zero(1) ref_idc(2) type(5); an
+//     SPS is type 7 and is always sent with ref_idc non-zero, so it reads
+//     0x27/0x47/0x67. Read as H.265 those are reserved or non-zero-layer
+//     types.
+func sniffCodec(data []byte) string {
+	i := 0
+	for i < len(data) {
+		idx := bytes.Index(data[i:], []byte{0, 0, 1})
+		if idx < 0 {
+			break
+		}
+		nalPos := i + idx + 3
+		if nalPos >= len(data) {
+			break
+		}
+		switch b := data[nalPos]; {
+		case b == 0x40, b == 0x42, b == 0x44:
+			return "H265"
+		case b&0x9F == 7 && b&0x60 != 0:
+			return "H264"
+		}
+		i = nalPos + 1
+	}
+	return ""
+}
+
 // AnalyzeFrame scans an H.264/H.265 annex-b frame for NAL units and reports
 // whether it contains a key NAL. The codec is required because H.264 and
 // H.265 NAL type fields overlap (e.g. a H.264 SPS byte also decodes as a H.265
