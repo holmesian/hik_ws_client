@@ -119,6 +119,48 @@ func TestParseSDP_MediaInfoHeader(t *testing.T) {
 	}
 }
 
+// TestParseSDP_UnknownMediaHeaderMagic covers the SDP a real H.264 camera
+// sent: the MEDIAINFO header is 40 bytes but its magic is "HVAG", not "IMKH",
+// and this client has no field layout for it. Leaving container and codec
+// blank is correct — guessing at the fields would be worse — and the client
+// then recovers both from the bitstream.
+func TestParseSDP_UnknownMediaHeaderMagic(t *testing.T) {
+	sdp := "v=0\ns=hikvision\nm=video 0 RTP/AVP 0\na=rtpmap:0 /0\n" +
+		"a=Media_header:MEDIAINFO=4856414701010000C400C001C0020000000000000000000064623333000000000000000000000000;\n"
+
+	info := ParseSDP(sdp)
+	if info.Container != "" || info.Codec != "" {
+		t.Fatalf("container/codec = %q/%q, want both empty for an undecodable header",
+			info.Container, info.Codec)
+	}
+}
+
+// TestSniffCodec covers the fallback used when the MEDIAINFO header cannot be
+// decoded. The NAL headers are the real ones taken from the archived captures.
+func TestSniffCodec(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"h264 sps", []byte{0, 0, 0, 1, 0x67, 0x42, 0x00, 0x29, 0, 0, 0, 1, 0x68, 0xca}, "H264"},
+		{"h264 sps ref_idc 1", []byte{0, 0, 1, 0x27, 0x42, 0x00, 0x29}, "H264"},
+		{"h265 vps", []byte{0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01, 0, 0, 0, 1, 0x42, 0x01}, "H265"},
+		{"h265 sps only", []byte{0, 0, 1, 0x42, 0x01, 0x01, 0x01, 0x60}, "H265"},
+		// A slice-only access unit names neither codec; the caller retries.
+		{"h264 non-idr slice", []byte{0, 0, 0, 1, 0x41, 0x9a, 0x00}, ""},
+		{"no start code", []byte{0x67, 0x42, 0x00, 0x29}, ""},
+		{"truncated after start code", []byte{0, 0, 1}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sniffCodec(tc.data); got != tc.want {
+				t.Errorf("sniffCodec = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseSDP_PSIgnoresAudioClock uses the SDP a real 1080p camera sent: the
 // video m-line advertises PCMA/8000, an audio clock. PS timestamps are 90kHz
 // regardless, and taking 8000 literally reported a 25 fps stream as 2.22 fps.

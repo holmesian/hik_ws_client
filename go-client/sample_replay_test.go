@@ -12,21 +12,25 @@ import (
 // self-consistent, while these replay bytes real cameras actually sent.
 var samples = []struct {
 	dir           string
+	codec         string
 	frames, keys  int
 	width, height int
+	spsNAL        int // NAL type of the SPS recoverResolution must return
 }{
-	{dir: "../samples/ps_h265_720p", frames: 611, keys: 25, width: 1280, height: 720},
-	{dir: "../samples/ps_h265_1080p", frames: 614, keys: 13, width: 1920, height: 1080},
+	{dir: "../samples/ps_h265_720p", codec: "H265", frames: 611, keys: 25, width: 1280, height: 720, spsNAL: 33},
+	{dir: "../samples/ps_h265_1080p", codec: "H265", frames: 614, keys: 13, width: 1920, height: 1080, spsNAL: 33},
+	{dir: "../samples/ps_h264_720p", codec: "H264", frames: 655, keys: 26, width: 1280, height: 720, spsNAL: 7},
 }
 
-// TestReplaySamples_PS_H265 replays each archived MPEG-PS/H.265 capture
-// through the demuxer and asserts the properties measured on the live link.
+// TestReplaySamples replays each archived MPEG-PS capture through the demuxer
+// and asserts the properties measured on the live link.
 //
-// The two bugs this repo has hit — a misread PES header length and an
-// unstripped SPS emulation-prevention byte — both left frame counts and
-// keyframe counts looking perfectly normal while corrupting the payload. So
-// this checks the payload structure, not just the tallies.
-func TestReplaySamples_PS_H265(t *testing.T) {
+// Every parser bug this repo has hit — a misread PES header length, an
+// unstripped SPS emulation-prevention byte, RTP headers left inside the
+// payload — left frame counts and keyframe counts looking perfectly normal
+// while corrupting the bitstream. So this checks the payload structure, not
+// just the tallies.
+func TestReplaySamples(t *testing.T) {
 	for _, s := range samples {
 		t.Run(filepath.Base(s.dir), func(t *testing.T) {
 			path := filepath.Join(s.dir, "stream.ps")
@@ -58,7 +62,7 @@ func TestReplaySamples_PS_H265(t *testing.T) {
 			keys, withPTS := 0, 0
 			var prevPTS int64
 			for i, f := range frames {
-				if AnalyzeFrame(f.Data, "H265") {
+				if AnalyzeFrame(f.Data, s.codec) {
 					keys++
 				}
 				if f.HasPTS {
@@ -87,7 +91,7 @@ func TestReplaySamples_PS_H265(t *testing.T) {
 			var gotW, gotH int
 			var sps []byte
 			for _, f := range frames {
-				if w, h, sp, ok := recoverResolution(f.Data, "H265"); ok {
+				if w, h, sp, ok := recoverResolution(f.Data, s.codec); ok {
 					gotW, gotH, sps = w, h, sp
 					break
 				}
@@ -101,8 +105,12 @@ func TestReplaySamples_PS_H265(t *testing.T) {
 			}
 			// sps starts at the 3-byte start code recoverResolution matched, so
 			// the NAL header byte is at index 3 regardless of start code length.
-			if got := int(sps[3]>>1) & 0x3F; got != 33 {
-				t.Errorf("recovered NAL type = %d, want 33 (SPS_NUT)", got)
+			got := int(sps[3]) & 0x1F
+			if s.codec == "H265" {
+				got = int(sps[3]>>1) & 0x3F
+			}
+			if got != s.spsNAL {
+				t.Errorf("recovered NAL type = %d, want %d (SPS)", got, s.spsNAL)
 			}
 		})
 	}
