@@ -108,8 +108,8 @@ def test_authorization():
     print(f"  authorization: {auth}")
 
     # 生成测试用的 realplay 请求
-    url = "ws://[fd00:0:2c0:9::10c]:559/openUrl/WtcNliV"
-    pwd = input("\nPassword (from URL): ").strip() or "WtcNliV"
+    url = "ws://[1111::2222]:559/openUrl/auth_token"
+    pwd = input("\nPassword (from URL): ").strip() or "auth_token"
 
     print(f"\nTest realplay request:")
     print(json.dumps({
