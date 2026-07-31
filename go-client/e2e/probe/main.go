@@ -85,7 +85,7 @@ func main() {
 		log.Printf("stream ended: %v", err)
 	}
 
-	summary := s.summarize(*url)
+	summary := s.summarize()
 	fmt.Print(summary)
 	if err := s.archive(*samples, *name, summary); err != nil {
 		log.Printf("archive: %v", err)
@@ -93,11 +93,11 @@ func main() {
 }
 
 type stats struct {
-	mu   sync.Mutex
-	info *hikws.MediaInfo
-	raw  bytes.Buffer // container bytes as received
-	es   bytes.Buffer // demuxed elementary stream (annex-b)
-	sps  []byte
+	mu      sync.Mutex
+	info    *hikws.MediaInfo
+	raw     bytes.Buffer // container bytes as received
+	esBytes int          // size of the demuxed elementary stream
+	sps     []byte
 
 	frames, keyframes, ptsSeen int
 	codec                      string
@@ -109,7 +109,7 @@ func (s *stats) frame(meta *hikws.FrameMeta, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.frames++
-	s.es.Write(data)
+	s.esBytes += len(data)
 	if meta.IsKeyFrame {
 		s.keyframes++
 	}
@@ -130,7 +130,7 @@ func (s *stats) frame(meta *hikws.FrameMeta, data []byte) {
 	}
 }
 
-func (s *stats) summarize(url string) string {
+func (s *stats) summarize() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var b strings.Builder
@@ -138,8 +138,11 @@ func (s *stats) summarize(url string) string {
 	if s.info != nil {
 		container, clock, w, h = s.info.Container, s.info.ClockRate, s.info.Width, s.info.Height
 	}
+	// The source URL is deliberately absent: host, internal proxy address and
+	// openUrl token are all deployment secrets, and none of them says anything
+	// about the bitstream. Samples are committed, so nothing identifying the
+	// deployment may reach this file.
 	fmt.Fprintln(&b, "==== probe summary ====")
-	fmt.Fprintf(&b, "url         : %s\n", url)
 	fmt.Fprintf(&b, "container   : %s\n", container)
 	fmt.Fprintf(&b, "codec       : %s\n", s.codec)
 	fmt.Fprintf(&b, "clockRate   : %d\n", clock)
@@ -147,7 +150,7 @@ func (s *stats) summarize(url string) string {
 	fmt.Fprintf(&b, "frames      : %d\n", s.frames)
 	fmt.Fprintf(&b, "keyframes   : %d\n", s.keyframes)
 	fmt.Fprintf(&b, "rawBytes    : %d\n", s.raw.Len())
-	fmt.Fprintf(&b, "esBytes     : %d\n", s.es.Len())
+	fmt.Fprintf(&b, "esBytes     : %d\n", s.esBytes)
 	if s.ptsSeen > 1 && clock > 0 && s.maxPTS > s.minPTS {
 		span := s.maxPTS - s.minPTS
 		fps := float64(s.ptsSeen-1) * float64(clock) / float64(span)
@@ -168,25 +171,34 @@ func (s *stats) archive(root, name, summary string) error {
 	if s.raw.Len() == 0 {
 		return fmt.Errorf("nothing captured, not archiving")
 	}
-	container, sdp := "unknown", ""
+	container, sdp, height := "unknown", "", 0
 	if s.info != nil {
-		container, sdp = s.info.Container, s.info.SDP
+		container, sdp, height = s.info.Container, s.info.SDP, s.info.Height
 	}
 	codec := s.codec
 	if codec == "" {
 		codec = "unknown"
 	}
 	if name == "" {
+		// The resolution is part of the directory name so a second device
+		// with the same container and codec lands beside the first instead
+		// of overwriting it — different resolutions exercise different SPS.
 		name = strings.ToLower(container + "_" + codec)
+		if height > 0 {
+			name = fmt.Sprintf("%s_%dp", name, height)
+		}
 	}
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
 
+	// Only the container bytes are archived. The elementary stream is fully
+	// regenerable from them (that is what the library does), and MPEG-PS is a
+	// standard container that ffprobe/ffplay read directly — keeping a second
+	// multi-MB derived copy in the repo buys nothing.
 	files := map[string][]byte{
 		"stream" + containerExt(container): s.raw.Bytes(),
-		"stream" + codecExt(codec):         s.es.Bytes(),
 		"summary.txt":                      []byte(summary),
 	}
 	if sdp != "" {
@@ -209,14 +221,4 @@ func containerExt(c string) string {
 		return ".ps"
 	}
 	return ".bin"
-}
-
-func codecExt(c string) string {
-	switch c {
-	case "H265":
-		return ".h265"
-	case "H264":
-		return ".h264"
-	}
-	return ".es"
 }

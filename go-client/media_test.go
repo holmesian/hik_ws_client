@@ -119,6 +119,22 @@ func TestParseSDP_MediaInfoHeader(t *testing.T) {
 	}
 }
 
+// TestParseSDP_PSIgnoresAudioClock uses the SDP a real 1080p camera sent: the
+// video m-line advertises PCMA/8000, an audio clock. PS timestamps are 90kHz
+// regardless, and taking 8000 literally reported a 25 fps stream as 2.22 fps.
+func TestParseSDP_PSIgnoresAudioClock(t *testing.T) {
+	sdp := "v=0\ns=hikvision\nm=video 0 RTP/AVP 8\na=rtpmap:8 PCMA/8000\n" +
+		"a=Media_header:MEDIAINFO=494D4B48000000000200050011710110401F000000FA000000000000000000000000000000000000;\n"
+
+	info := ParseSDP(sdp)
+	if info.Container != "PS" || info.Codec != "H265" {
+		t.Fatalf("container/codec = %q/%q, want PS/H265", info.Container, info.Codec)
+	}
+	if info.ClockRate != 90000 {
+		t.Fatalf("clock = %d, want 90000 (PS is 90kHz, not the rtpmap audio clock)", info.ClockRate)
+	}
+}
+
 // TestParseH265SPS decodes a hand-built HEVC SPS and checks the recovered
 // resolution. Resolution is what the MEDIAINFO header lacks, so this is the
 // path that fills Width/Height for a PS/H265 stream.

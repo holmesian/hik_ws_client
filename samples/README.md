@@ -15,26 +15,53 @@ go run ./e2e/probe -url 'wss://<host>:<port>/proxy/[<ip>]:<port>/openUrl/<token>
 
 ## 目录约定
 
-按**容器 + 编码**分类，一种组合一个目录，例如 `ps_h265/`、`ps_h264/`、`raw_h264/`。
-目录名由 `probe` 从 MEDIAINFO 自动推导，也可用 `-name` 覆盖。
+按**容器 + 编码 + 分辨率**分类，一种组合一个目录，例如 `ps_h265_720p/`、
+`ps_h265_1080p/`、`ps_h264_1080p/`。目录名由 `probe` 从 MEDIAINFO 与码流内 SPS
+自动推导（同容器同编码的不同分辨率因此不会互相覆盖），也可用 `-name` 覆盖。
 
 每个目录内：
 
 | 文件 | 内容 |
 | --- | --- |
-| `stream.ps` / `stream.bin` | 解复用**前**的容器原始字节，最有价值的复现材料 |
-| `stream.h265` / `stream.h264` | 解复用后的 annex-b 基本流，可直接 `ffprobe` / `ffplay` |
+| `stream.ps` / `stream.bin` | 解复用**前**的容器原始字节，唯一不可再生的材料 |
 | `stream.sdp` | realplay 返回的 SDP 原文（含 MEDIAINFO 头） |
 | `sps.bin` | 命中的第一个 SPS NAL，分辨率解析回归用 |
 | `summary.txt` | 该次采集的容器/编码/分辨率/帧数/关键帧/PTS/fps 摘要 |
 
-验证样本：
+**样本里不得出现任何部署信息**：主机名、代理内网地址、openUrl token、设备名一律
+不写入归档文件。`probe` 的摘要因此完全不记录源 URL——它对分析码流毫无价值，却是
+提交进仓库后擦不掉的东西。归档前用 `grep -ri '<你的域名>' samples/` 自查一次。
+
+只存容器原始字节，不存解复用后的基本流：后者由组件从前者完整再生，且 MPEG-PS
+本身是标准容器，ffmpeg 可直接读，没必要在仓库里再放一份几 MB 的派生产物。
 
 ```bash
-ffprobe -v error -show_streams samples/ps_h265/stream.h265
+ffprobe -v error -show_streams samples/ps_h265_720p/stream.ps
 ```
 
+## 回归复用
+
+`go-client/sample_replay_test.go` 把样本重放进解复用器，断言帧数、关键帧数、
+PTS 单调性、每个访问单元以起始码开头、以及从码流内 SPS 还原的分辨率；样本缺失时
+自动 skip。这样每次改解析逻辑都会被真实设备字节校验一次——合成用例只能证明
+解析器自洽，证明不了它跟真机一致。
+
 ## 已知码流特征（实测结论，非文档推测）
+
+两份样本的实测值：
+
+| | `ps_h265_720p` | `ps_h265_1080p` |
+| --- | --- | --- |
+| 分辨率 | 1280x720 | 1920x1080 |
+| 帧数 / 关键帧 | 611 / 25 | 614 / 13 |
+| GOP | 25 | 50 |
+| 原始字节 | 5,301,664 | 2,944,632 |
+| fps（PTS 推算） | 24.93 | 25.01 |
+| 视频 PES / 音频 PES | 2163 / 32 | 1219 / 646 |
+| SDP rtpmap | `0 /0`（空） | `8 PCMA/8000` |
+
+两者 NAL 构成一致：VPS / SPS / PPS / SEI / IDR_W_RADL 各等于关键帧数，其余为
+TRAIL_R —— **每个关键帧前都重发一次参数集**，所以任意关键帧处切入都能解码。
 
 - **容器是 MPEG-PS，不是裸 annex-b。** 编码是 H.265。二者只声明在 SDP 的
   `a=Media_header:MEDIAINFO=<hex>` 里：40 字节 IMKH 头，offset 8-9 为容器
@@ -47,11 +74,27 @@ ffprobe -v error -show_streams samples/ps_h265/stream.h265
 - **PES 可选头是 3 字节**（`flags1` / `PTS_DTS_flags` / `PES_header_data_length`）。
   把长度当成第 2 字节读，会把 `0x80` 的 PTS 标志当成 128 字节头长：每个 PES payload
   被砍掉前 128 字节、PTS 也早解一字节。症状极隐蔽——帧数、关键帧数、码率看着都正常。
+
+  样本实测头部（2147 个视频 PES）：`flags1` 只取 `0x8C`/`0x88`（高两位恒为 `10`），
+  `PES_header_data_length` 分布在 2..10，带 PTS 时为 8（5 字节 PTS + 3 字节 `0xFF` 填充）。
+  例如首个 PES 头是 `8c 80 08 23 c7 dd c4 69 ff ff fc`，其后紧跟 `00 00 00 01 40 01`（VPS）。
+  按错误解法，这个包会跳过 128 字节，直接把整个 VPS 连同后面的内容一起吞掉。
 - **H.265/H.264 SPS 必须先去除防竞争字节（EPB）再做位解析。** H.265 的
   `general_profile_compatibility_flag` 是 32 位常为 0 的字段，天然构成 `00 00 00 00`，
   在线上会被编码成 `00 00 03 00 ...`；不剥离就会导致后续所有字段错位，实测把
   1280x720 解析成 `2x1`。
-- PTS 是 33 位、90kHz。
+
+  样本里真实的 SPS（`sps.bin`，37 字节）：
+  `00 00 01 42 01 01 01 60 00 00 03 00 b0 00 00 03 00 00 03 00 5d a0 02 80 80 2d ...`
+  —— 三处 `00 00 03` 转义全部落在 profile 区，正是错位的来源。
+- PTS 是 33 位、90kHz，且**不从 0 开始**（两份样本首帧分别是 1912037940、
+  4040951220），不能假设起点为 0。
+- **PS 的时钟恒为 90kHz，不能采信 SDP 的 rtpmap。** `ps_h265_1080p` 的设备在
+  video m-line 上写的是 `a=rtpmap:8 PCMA/8000`（音频时钟），照抄会把 25 fps 的流
+  算成 2.22 fps。MPEG-PS 的 PTS 单位由容器规范固定，与 rtpmap 无关。
+- **同一路 PS 里会混有音频 PES**（`ps_h265_1080p` 有 646 个，stream_id `0xC0`
+  段）。解复用必须按长度跳过它们，只把 `0xE0..0xEF` 的载荷拼进视频访问单元；
+  这份样本是第一份音频占比可观的真机流，正好验证了这条路径。
 
 ## 踩坑记录
 
@@ -60,3 +103,5 @@ ffprobe -v error -show_streams samples/ps_h265/stream.h265
   复用 helper。
 - **"帧数对、关键帧对"不等于解析正确。** 上面的 PES 截断问题在摘要里完全看不出来，
   只有对照 `ffprobe` 或逐字节回放归档样本才能发现。这正是要留样本的原因。
+- **一次连接只做一件事的工具设计是错的。** token 分钟级过期，"先分析再抓包"的两次
+  运行第二次必然失败，白白烧掉一个链接。`probe` 因此把两件事合并进同一次连接。
