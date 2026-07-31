@@ -172,6 +172,45 @@ func TestRTPDetector(t *testing.T) {
 	}
 }
 
+// A WebSocket message boundary is not an RTP packet boundary. The HVAG camera
+// family splits its first 8204-byte packet into 8192 bytes plus a 12-byte
+// tail, so the second message is the middle of a packet, not a header. When
+// the detector demanded two *adjacent* RTP messages this classified a live RTP
+// session as bare and left every header inside the bitstream.
+func TestRTPDetectorSurvivesFragmentedFirstPacket(t *testing.T) {
+	head := []byte{
+		0x80, 0x60, 0x2c, 0x25, 0x00, 0x00, 0x00, 0x00, 0x69, 0x54, 0xd8, 0x56,
+		0x00, 0x00, 0x01, 0xba, 0x11,
+	}
+	// The remainder of that same packet, delivered as its own message. It is
+	// payload, so it must reach the demuxer byte for byte.
+	tail := []byte{0x4d, 0x2a, 0xf7, 0x5b, 0x5d, 0xf9, 0xcd, 0x32, 0x70, 0x85, 0x02, 0x6b}
+	next := []byte{
+		0x80, 0x60, 0x2c, 0x26, 0x00, 0x00, 0x00, 0x00, 0x69, 0x54, 0xd8, 0x56,
+		0x22, 0x33, 0x44,
+	}
+
+	var d rtpDetector
+	var got [][]byte
+	for _, m := range [][]byte{head, tail, next} {
+		got = append(got, d.feed(m)...)
+	}
+	got = append(got, d.flush()...)
+
+	if !d.isRTP {
+		t.Fatal("session with a fragmented first packet was not recognised as RTP")
+	}
+	want := [][]byte{{0x00, 0x00, 0x01, 0xba, 0x11}, tail, {0x22, 0x33, 0x44}}
+	if len(got) != len(want) {
+		t.Fatalf("released %d payloads, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Errorf("payload %d = % x, want % x", i, got[i], want[i])
+		}
+	}
+}
+
 // A session that ends after a single RTP-looking message must still deliver
 // it: there is no second packet to confirm the sequence, and dropping the only
 // payload is worse than passing it through.

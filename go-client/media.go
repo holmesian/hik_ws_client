@@ -228,6 +228,32 @@ func parseH264SPS(b64 string) (int, int, error) {
 	return parseH264SPSBytes(raw)
 }
 
+// skipScalingList consumes one scaling_list() from the SPS.
+//
+// The list is NOT a fixed run of size se(v) values: H.264 7.3.2.1.1.1 reads
+// delta_scale only while nextScale is non-zero, and a zero ends the list
+// early — the remaining entries are inferred, not coded. Reading all of them
+// unconditionally over-runs the SPS. Measured on a live 720p High-profile
+// camera, six 16-entry lists coded 20 bits each instead of 16 values, so the
+// parser ran off the end of the NAL, returned an error, and the client
+// reported the stream as 0x0 with no resolution at all.
+func skipScalingList(br *bitReader, size int) error {
+	lastScale, nextScale := 8, 8
+	for j := 0; j < size; j++ {
+		if nextScale != 0 {
+			delta, err := br.readSE()
+			if err != nil {
+				return err
+			}
+			nextScale = (lastScale + delta + 256) % 256
+		}
+		if nextScale != 0 {
+			lastScale = nextScale
+		}
+	}
+	return nil
+}
+
 // parseH264SPSBytes decodes width/height from an already-decoded H.264 SPS
 // NAL unit (including its 1-byte NAL header).
 func parseH264SPSBytes(raw []byte) (int, int, error) {
@@ -291,10 +317,8 @@ func parseH264SPSBytes(raw []byte) (int, int, error) {
 					if i >= 6 {
 						size = 64
 					}
-					for j := 0; j < size; j++ {
-						if _, err = br.readSE(); err != nil {
-							return 0, 0, err
-						}
+					if err = skipScalingList(br, size); err != nil {
+						return 0, 0, err
 					}
 				}
 			}

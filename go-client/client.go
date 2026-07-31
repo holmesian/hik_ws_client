@@ -235,6 +235,13 @@ func (c *HikMediaClient) feedContainer(data []byte) {
 		if (c.mediaInfo != nil && c.mediaInfo.Container == "PS") ||
 			((c.mediaInfo == nil || c.mediaInfo.Container == "") && isPSData(data)) {
 			c.ps = &psDemuxer{}
+			// Write the sniffed verdict back: for the HVAG family it is the
+			// only source of the container, and the 90kHz PS clock it implies
+			// is what turns PTS into a frame rate. Left unset, callers report
+			// an empty container on a stream this client is demuxing as PS.
+			if c.mediaInfo != nil && c.mediaInfo.Container == "" {
+				c.mediaInfo.Container, c.mediaInfo.ClockRate = "PS", 90000
+			}
 		}
 	}
 	if c.ps == nil {
@@ -246,10 +253,20 @@ func (c *HikMediaClient) feedContainer(data []byte) {
 	}
 }
 
-// isPSData reports whether b begins with an MPEG-PS pack header
-// (00 00 01 ba), used to demux streams whose SDP has not arrived yet.
+// isPSData reports whether b begins with an MPEG-PS start code, used to demux
+// streams whose MEDIAINFO header does not name the container.
+//
+// Any PS start code counts, not just the pack header: a live stream is joined
+// at an arbitrary point, so its first message can begin on any packet of the
+// container. One camera in the fleet opens on an audio PES (00 00 01 c0) and
+// was classified as a non-PS stream for its whole session, which delivered raw
+// transport chunks as if they were frames.
+//
+// The 0xB9 floor is what keeps this from matching a bare annex-b elementary
+// stream: a NAL header byte always has its top bit clear, so it can never
+// reach the stream IDs the container uses.
 func isPSData(b []byte) bool {
-	return len(b) >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] == psPackStart
+	return len(b) >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] >= psEndCode
 }
 
 // deliverFrame recovers the per-frame metadata and hands the payload to the

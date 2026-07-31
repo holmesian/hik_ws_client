@@ -50,16 +50,22 @@ func Unpack(data []byte) (*ProtocolMessage, error) {
 	}
 
 	typ := data[0]
-	length := binary.BigEndian.Uint32(data[1:5])
+	// The length must be widened before the bounds check. Media bytes reach
+	// this function whenever a frame carries no protocol envelope, so the four
+	// declared length bytes are arbitrary: on a live camera they read
+	// 0xFFFFFFFB, 5+length wrapped to 0 in uint32, the check passed, and
+	// data[5:0] panicked and took the whole process down.
+	length := uint64(binary.BigEndian.Uint32(data[1:5]))
 
-	if uint32(len(data)) < 5+length {
+	if uint64(len(data)) < 5+length {
 		return nil, fmt.Errorf("insufficient length for payload")
 	}
+	end := 5 + int(length)
 
 	return &ProtocolMessage{
 		Type:      typ &^ EncryptFlag,
 		Encrypted: typ&EncryptFlag != 0,
-		Payload:   data[5 : 5+length],
-		Remaining: data[5+length:],
+		Payload:   data[5:end],
+		Remaining: data[end:],
 	}, nil
 }

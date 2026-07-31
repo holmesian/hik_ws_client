@@ -87,6 +87,24 @@ func TestUnpack(t *testing.T) {
 	}
 }
 
+// Media bytes are handed to Unpack whenever a frame carries no protocol
+// envelope, so the four length bytes are arbitrary. A length near 2^32 used to
+// wrap the 5+length bounds check in uint32, pass it, and then panic on the
+// slice — killing the process from stream content.
+func TestUnpackRejectsOverflowingLength(t *testing.T) {
+	for _, length := range [][4]byte{
+		{0xFF, 0xFF, 0xFF, 0xFF},
+		{0xFF, 0xFF, 0xFF, 0xFB}, // 5+length wraps to exactly 0
+		{0x7F, 0xFF, 0xFF, 0xFF},
+	} {
+		raw := append([]byte{0x40}, length[:]...)
+		raw = append(raw, 'A', 'B')
+		if msg, err := Unpack(raw); err == nil {
+			t.Fatalf("length % x accepted, payload %d bytes", length, len(msg.Payload))
+		}
+	}
+}
+
 // TestParseSDP_MediaInfoHeader verifies the Hikvision MEDIAINFO header (carried
 // in a=Media_header:MEDIAINFO=<hex>) overrides rtpmap and sets the container
 // and codec. The cameras send this instead of sprop-parameter-sets, so the
@@ -211,6 +229,29 @@ func TestParseH265SPS(t *testing.T) {
 	}
 	if gotW != 1920 || gotH != 1080 {
 		t.Fatalf("dims = %dx%d, want 1920x1080", gotW, gotH)
+	}
+}
+
+// TestParseH264SPS_HighProfileScalingLists uses an SPS captured verbatim from a
+// live High-profile camera rather than a hand-built one: the bug it guards
+// against is a mis-read of scaling_list(), and a hand-built SPS would be
+// written with whatever wrong rule the parser used. This device codes six
+// scaling lists that terminate early — 20 bits each, not 16 se(v) values.
+// Reading them as fixed-length runs overran the NAL, so parseH264SPSBytes
+// failed and the client reported the camera as 0x0 for the whole session.
+func TestParseH264SPS_HighProfileScalingLists(t *testing.T) {
+	sps := []byte{
+		0x67, 0x64, 0x00, 0x1f, 0xad, 0x84, 0x01, 0x0c, 0x20, 0x08, 0x61, 0x00,
+		0x43, 0x08, 0x02, 0x18, 0x40, 0x10, 0xc2, 0x00, 0x84, 0x3b, 0x70, 0x28,
+		0x02, 0xdd, 0x37, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0x03, 0x00, 0x40,
+		0x00, 0x00, 0x0c, 0xa1, 0x00,
+	}
+	w, h, err := parseH264SPSBytes(sps)
+	if err != nil {
+		t.Fatalf("parseH264SPSBytes: %v", err)
+	}
+	if w != 1280 || h != 720 {
+		t.Fatalf("dims = %dx%d, want 1280x720", w, h)
 	}
 }
 
