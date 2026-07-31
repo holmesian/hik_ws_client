@@ -93,11 +93,11 @@ func main() {
 }
 
 type stats struct {
-	mu   sync.Mutex
-	info *hikws.MediaInfo
-	raw  bytes.Buffer // container bytes as received
-	es   bytes.Buffer // demuxed elementary stream (annex-b)
-	sps  []byte
+	mu      sync.Mutex
+	info    *hikws.MediaInfo
+	raw     bytes.Buffer // container bytes as received
+	esBytes int          // size of the demuxed elementary stream
+	sps     []byte
 
 	frames, keyframes, ptsSeen int
 	codec                      string
@@ -109,7 +109,7 @@ func (s *stats) frame(meta *hikws.FrameMeta, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.frames++
-	s.es.Write(data)
+	s.esBytes += len(data)
 	if meta.IsKeyFrame {
 		s.keyframes++
 	}
@@ -139,7 +139,9 @@ func (s *stats) summarize(url string) string {
 		container, clock, w, h = s.info.Container, s.info.ClockRate, s.info.Width, s.info.Height
 	}
 	fmt.Fprintln(&b, "==== probe summary ====")
-	fmt.Fprintf(&b, "url         : %s\n", url)
+	// The openUrl token is a credential. It is single-use and already dead by
+	// the time this is written, but it does not belong in a committed sample.
+	fmt.Fprintf(&b, "url         : %s\n", redactToken(url))
 	fmt.Fprintf(&b, "container   : %s\n", container)
 	fmt.Fprintf(&b, "codec       : %s\n", s.codec)
 	fmt.Fprintf(&b, "clockRate   : %d\n", clock)
@@ -147,7 +149,7 @@ func (s *stats) summarize(url string) string {
 	fmt.Fprintf(&b, "frames      : %d\n", s.frames)
 	fmt.Fprintf(&b, "keyframes   : %d\n", s.keyframes)
 	fmt.Fprintf(&b, "rawBytes    : %d\n", s.raw.Len())
-	fmt.Fprintf(&b, "esBytes     : %d\n", s.es.Len())
+	fmt.Fprintf(&b, "esBytes     : %d\n", s.esBytes)
 	if s.ptsSeen > 1 && clock > 0 && s.maxPTS > s.minPTS {
 		span := s.maxPTS - s.minPTS
 		fps := float64(s.ptsSeen-1) * float64(clock) / float64(span)
@@ -184,9 +186,12 @@ func (s *stats) archive(root, name, summary string) error {
 		return err
 	}
 
+	// Only the container bytes are archived. The elementary stream is fully
+	// regenerable from them (that is what the library does), and MPEG-PS is a
+	// standard container that ffprobe/ffplay read directly — keeping a second
+	// multi-MB derived copy in the repo buys nothing.
 	files := map[string][]byte{
 		"stream" + containerExt(container): s.raw.Bytes(),
-		"stream" + codecExt(codec):         s.es.Bytes(),
 		"summary.txt":                      []byte(summary),
 	}
 	if sdp != "" {
@@ -204,19 +209,17 @@ func (s *stats) archive(root, name, summary string) error {
 	return nil
 }
 
+// redactToken replaces the openUrl token with a placeholder.
+func redactToken(url string) string {
+	if i := strings.LastIndex(url, "/openUrl/"); i >= 0 {
+		return url[:i+len("/openUrl/")] + "<token>"
+	}
+	return url
+}
+
 func containerExt(c string) string {
 	if c == "PS" {
 		return ".ps"
 	}
 	return ".bin"
-}
-
-func codecExt(c string) string {
-	switch c {
-	case "H265":
-		return ".h265"
-	case "H264":
-		return ".h264"
-	}
-	return ".es"
 }

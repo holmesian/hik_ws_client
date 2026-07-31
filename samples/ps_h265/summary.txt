@@ -1,0 +1,12 @@
+==== probe summary ====
+url         : wss://ipcbasehkvideolj.coolmitech.com:6014/proxy/[fd00:0:2c0:9::10c]:559/openUrl/<token>
+container   : PS
+codec       : H265
+clockRate   : 90000
+resolution  : 1280x720
+frames      : 611
+keyframes   : 25
+rawBytes    : 5301664
+esBytes     : 5255557
+pts         : 611 frames, 1912037940..1914239700 (2201760 ticks @90000Hz => 24.93 fps)
+=======================

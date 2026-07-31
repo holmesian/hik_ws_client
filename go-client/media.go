@@ -557,7 +557,19 @@ func recoverResolution(data []byte, codec string) (int, int, []byte, bool) {
 			t = int(b & 0x1F)
 		}
 		if t == int(spsType) {
-			sps := data[pos:] // start code + NAL, the canonical unit to archive
+			// Bound the NAL at the next start code. Slicing to the end of the
+			// access unit still parses (the bit reader stops early), but it
+			// hands callers the whole remainder of the key frame instead of
+			// the SPS — the archived sps.bin came out ~89KB.
+			end := len(data)
+			if next := bytes.Index(data[nalPos:], []byte{0, 0, 1}); next >= 0 {
+				end = nalPos + next
+				// A 4-byte start code (00 00 00 01) leaves a trailing zero.
+				if end > nalPos && data[end-1] == 0 {
+					end--
+				}
+			}
+			sps := data[pos:end] // start code + NAL, the canonical unit to archive
 			if isH265 {
 				if w, h, err := parseH265SPS(sps[3:]); err == nil {
 					return w, h, sps, true
