@@ -49,6 +49,7 @@ python3 -m unittest test_hik_media
 | --- | --- |
 | [docs/protocol.md](./docs/protocol.md) | 传输层协议：连接模型、握手、鉴权与密钥派生、封包格式、错误码 |
 | [docs/media-pipeline.md](./docs/media-pipeline.md) | 媒体管线：RTP 判定与剥离 → PS 解复用 → 访问单元 → 元信息恢复 |
+| [docs/ptz-stream-observability.md](./docs/ptz-stream-observability.md) | 云台转动时码流里能不能看出来：4 台设备 64 次转动的受控差分实测 |
 | [docs/python-api.md](./docs/python-api.md) | Python 客户端用法与回调 |
 | [go-client/README.md](./go-client/README.md) | Go 客户端 API、健壮性与并发选项 |
 | [go-client/e2e/bench/README.md](./go-client/e2e/bench/README.md) | 多路并发压测与内存复用优化实测：并发梯度、单路资源基线、上限判据 |
@@ -74,7 +75,9 @@ hik_ws_client/
 ## 已知限制
 
 1. **音频**原样下发，未解 PES、未解码。
-2. **码流里没有云台信息**——94 台设备普查确认 `0xBD` 私有流不含坐标/角度，PTZ 需走设备独立
+2. **码流里没有云台信息**——94 台设备普查确认 `0xBD` 私有流不含坐标/角度；**转动过程中**同样
+   没有（4 台设备 64 次转动的受控差分，见
+   [docs/ptz-stream-observability.md](./docs/ptz-stream-observability.md)）。PTZ 需走设备独立
    控制接口。
 3. **`0xBD` 私有记录为 ECB 加密**，无设备密钥，内容无法验证。
 

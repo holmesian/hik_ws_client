@@ -1,14 +1,18 @@
 package hikws
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -359,6 +363,88 @@ func TestIntegration_ServerErrorText(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("OnError never fired for errorCode != 0")
 	}
+}
+
+// TestIntegration_DiscardedMessagesAreLoggedNotParsed pins the diagnostic
+// exit added for the PTZ observability experiment: a text message that
+// carries neither an errorCode nor an SDP, and a binary protocol message of
+// an unknown type, must both reach the Verbose log — and must still be
+// discarded, exactly as before. The log line is the only way to answer
+// "did the proxy push anything while the camera moved", and the openUrl
+// tokens are single-use, so a message dropped without a trace is gone.
+func TestIntegration_DiscardedMessagesAreLoggedNotParsed(t *testing.T) {
+	cfg := startMock(t, func(t *testing.T, conn *websocket.Conn) {
+		sendAuth(t, conn)
+		expectRealplay(t, conn)
+		_ = conn.WriteJSON(map[string]interface{}{"errorCode": 0, "sdp": testSDP})
+		// A text frame the client has no handler for.
+		_ = conn.WriteJSON(map[string]interface{}{"cmd": "ptzStatus", "pan": 1200})
+		// Text that is not JSON at all.
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("not json"))
+		// An unknown binary protocol type, then a real frame after it: the
+		// unknown one must not derail the parse of what follows.
+		_ = conn.WriteMessage(websocket.BinaryMessage, PackMessage(0x07, []byte("\x01\x02\x03status")))
+		_ = conn.WriteMessage(websocket.BinaryMessage, PackMessage(MsgTypeVideoData, idrFrame))
+		time.Sleep(400 * time.Millisecond)
+	})
+	cfg.Verbose = true
+
+	var logBuf syncBuffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := connectAndPlay(t, cfg, ctx)
+
+	frames := make(chan []byte, 4)
+	c.OnVideoData = func(b []byte) { frames <- append([]byte(nil), b...) }
+	c.OnError = func(e error) { t.Errorf("unexpected error: %v", e) }
+	go c.Run(ctx)
+
+	select {
+	case got := <-frames:
+		// The discarded messages must not have been delivered as media, and
+		// must not have shifted the parse of the frame that follows them.
+		if !bytes.Equal(got, idrFrame) {
+			t.Errorf("frame = %x, want %x", got, idrFrame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no video frame after the discarded messages")
+	}
+	if n := len(frames); n != 0 {
+		t.Errorf("%d extra payloads delivered; discarded messages leaked into the media path", n)
+	}
+
+	out := logBuf.String()
+	for _, want := range []string{
+		`Text msg (no errorCode/sdp): 31 bytes keys=[cmd pan]`,
+		`Text msg (not JSON): 8 bytes`,
+		`Protocol msg 0x07: 9 bytes (discarded) head=010203737461747573`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("Verbose log missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent writes the log
+// package makes from the read loop while the test goroutine reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // TestIntegration_AuthenticateServerError verifies Authenticate rejects an
