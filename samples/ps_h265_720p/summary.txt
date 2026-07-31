@@ -1,5 +1,4 @@
 ==== probe summary ====
-url         : wss://ipcbasehkvideolj.coolmitech.com:6014/proxy/[fd00:0:2c0:9::10c]:559/openUrl/<token>
 container   : PS
 codec       : H265
 clockRate   : 90000

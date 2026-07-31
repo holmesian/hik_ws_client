@@ -85,7 +85,7 @@ func main() {
 		log.Printf("stream ended: %v", err)
 	}
 
-	summary := s.summarize(*url)
+	summary := s.summarize()
 	fmt.Print(summary)
 	if err := s.archive(*samples, *name, summary); err != nil {
 		log.Printf("archive: %v", err)
@@ -130,7 +130,7 @@ func (s *stats) frame(meta *hikws.FrameMeta, data []byte) {
 	}
 }
 
-func (s *stats) summarize(url string) string {
+func (s *stats) summarize() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var b strings.Builder
@@ -138,10 +138,11 @@ func (s *stats) summarize(url string) string {
 	if s.info != nil {
 		container, clock, w, h = s.info.Container, s.info.ClockRate, s.info.Width, s.info.Height
 	}
+	// The source URL is deliberately absent: host, internal proxy address and
+	// openUrl token are all deployment secrets, and none of them says anything
+	// about the bitstream. Samples are committed, so nothing identifying the
+	// deployment may reach this file.
 	fmt.Fprintln(&b, "==== probe summary ====")
-	// The openUrl token is a credential. It is single-use and already dead by
-	// the time this is written, but it does not belong in a committed sample.
-	fmt.Fprintf(&b, "url         : %s\n", redactToken(url))
 	fmt.Fprintf(&b, "container   : %s\n", container)
 	fmt.Fprintf(&b, "codec       : %s\n", s.codec)
 	fmt.Fprintf(&b, "clockRate   : %d\n", clock)
@@ -170,16 +171,22 @@ func (s *stats) archive(root, name, summary string) error {
 	if s.raw.Len() == 0 {
 		return fmt.Errorf("nothing captured, not archiving")
 	}
-	container, sdp := "unknown", ""
+	container, sdp, height := "unknown", "", 0
 	if s.info != nil {
-		container, sdp = s.info.Container, s.info.SDP
+		container, sdp, height = s.info.Container, s.info.SDP, s.info.Height
 	}
 	codec := s.codec
 	if codec == "" {
 		codec = "unknown"
 	}
 	if name == "" {
+		// The resolution is part of the directory name so a second device
+		// with the same container and codec lands beside the first instead
+		// of overwriting it — different resolutions exercise different SPS.
 		name = strings.ToLower(container + "_" + codec)
+		if height > 0 {
+			name = fmt.Sprintf("%s_%dp", name, height)
+		}
 	}
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -207,14 +214,6 @@ func (s *stats) archive(root, name, summary string) error {
 	}
 	log.Printf("archived %d bytes to %s", s.raw.Len(), dir)
 	return nil
-}
-
-// redactToken replaces the openUrl token with a placeholder.
-func redactToken(url string) string {
-	if i := strings.LastIndex(url, "/openUrl/"); i >= 0 {
-		return url[:i+len("/openUrl/")] + "<token>"
-	}
-	return url
 }
 
 func containerExt(c string) string {

@@ -95,8 +95,12 @@ func ParseSDP(sdp string) *MediaInfo {
 	// The MEDIAINFO header is authoritative for container and codec and
 	// overrides rtpmap, which the cameras leave blank.
 	applyMediaHeader(info, mediaHeader)
-	if info.Container == "PS" && info.ClockRate == 0 {
-		info.ClockRate = 90000 // PS timestamps are 90kHz by definition
+	if info.Container == "PS" {
+		// PS timestamps are 90kHz by definition, whatever rtpmap says. Some
+		// cameras describe the track as "a=rtpmap:8 PCMA/8000" — an audio
+		// clock on the video m-line — and taking that literally turns every
+		// PTS-derived rate into nonsense (2.22 fps for a 25 fps stream).
+		info.ClockRate = 90000
 	}
 	return info
 }

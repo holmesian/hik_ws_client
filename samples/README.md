@@ -15,8 +15,9 @@ go run ./e2e/probe -url 'wss://<host>:<port>/proxy/[<ip>]:<port>/openUrl/<token>
 
 ## 目录约定
 
-按**容器 + 编码**分类，一种组合一个目录，例如 `ps_h265/`、`ps_h264/`、`raw_h264/`。
-目录名由 `probe` 从 MEDIAINFO 自动推导，也可用 `-name` 覆盖。
+按**容器 + 编码 + 分辨率**分类，一种组合一个目录，例如 `ps_h265_720p/`、
+`ps_h265_1080p/`、`ps_h264_1080p/`。目录名由 `probe` 从 MEDIAINFO 与码流内 SPS
+自动推导（同容器同编码的不同分辨率因此不会互相覆盖），也可用 `-name` 覆盖。
 
 每个目录内：
 
@@ -25,13 +26,17 @@ go run ./e2e/probe -url 'wss://<host>:<port>/proxy/[<ip>]:<port>/openUrl/<token>
 | `stream.ps` / `stream.bin` | 解复用**前**的容器原始字节，唯一不可再生的材料 |
 | `stream.sdp` | realplay 返回的 SDP 原文（含 MEDIAINFO 头） |
 | `sps.bin` | 命中的第一个 SPS NAL，分辨率解析回归用 |
-| `summary.txt` | 该次采集的容器/编码/分辨率/帧数/关键帧/PTS/fps 摘要（token 已脱敏） |
+| `summary.txt` | 该次采集的容器/编码/分辨率/帧数/关键帧/PTS/fps 摘要 |
+
+**样本里不得出现任何部署信息**：主机名、代理内网地址、openUrl token、设备名一律
+不写入归档文件。`probe` 的摘要因此完全不记录源 URL——它对分析码流毫无价值，却是
+提交进仓库后擦不掉的东西。归档前用 `grep -ri '<你的域名>' samples/` 自查一次。
 
 只存容器原始字节，不存解复用后的基本流：后者由组件从前者完整再生，且 MPEG-PS
 本身是标准容器，ffmpeg 可直接读，没必要在仓库里再放一份几 MB 的派生产物。
 
 ```bash
-ffprobe -v error -show_streams samples/ps_h265/stream.ps
+ffprobe -v error -show_streams samples/ps_h265_720p/stream.ps
 ```
 
 ## 回归复用
@@ -43,10 +48,20 @@ PTS 单调性、每个访问单元以起始码开头、以及从码流内 SPS �
 
 ## 已知码流特征（实测结论，非文档推测）
 
-`ps_h265/` 实测值（大港干渠上跨沪昆线电务专用，1280x720 H.265，25s）：
-611 帧 / 25 关键帧 / 5.3MB / 24.93 fps / PTS 90kHz 连续。
-NAL 构成：VPS 25、SPS 25、PPS 25、SEI 25、IDR_W_RADL 25、TRAIL_R 586 ——
-**每个关键帧前都重发一次参数集**，所以任意关键帧处切入都能解码。
+两份样本的实测值：
+
+| | `ps_h265_720p` | `ps_h265_1080p` |
+| --- | --- | --- |
+| 分辨率 | 1280x720 | 1920x1080 |
+| 帧数 / 关键帧 | 611 / 25 | 614 / 13 |
+| GOP | 25 | 50 |
+| 原始字节 | 5,301,664 | 2,944,632 |
+| fps（PTS 推算） | 24.93 | 25.01 |
+| 视频 PES / 音频 PES | 2163 / 32 | 1219 / 646 |
+| SDP rtpmap | `0 /0`（空） | `8 PCMA/8000` |
+
+两者 NAL 构成一致：VPS / SPS / PPS / SEI / IDR_W_RADL 各等于关键帧数，其余为
+TRAIL_R —— **每个关键帧前都重发一次参数集**，所以任意关键帧处切入都能解码。
 
 - **容器是 MPEG-PS，不是裸 annex-b。** 编码是 H.265。二者只声明在 SDP 的
   `a=Media_header:MEDIAINFO=<hex>` 里：40 字节 IMKH 头，offset 8-9 为容器
@@ -72,7 +87,14 @@ NAL 构成：VPS 25、SPS 25、PPS 25、SEI 25、IDR_W_RADL 25、TRAIL_R 586 —
   样本里真实的 SPS（`sps.bin`，37 字节）：
   `00 00 01 42 01 01 01 60 00 00 03 00 b0 00 00 03 00 00 03 00 5d a0 02 80 80 2d ...`
   —— 三处 `00 00 03` 转义全部落在 profile 区，正是错位的来源。
-- PTS 是 33 位、90kHz，且**不从 0 开始**（样本首帧 1912037940），不能假设起点为 0。
+- PTS 是 33 位、90kHz，且**不从 0 开始**（两份样本首帧分别是 1912037940、
+  4040951220），不能假设起点为 0。
+- **PS 的时钟恒为 90kHz，不能采信 SDP 的 rtpmap。** `ps_h265_1080p` 的设备在
+  video m-line 上写的是 `a=rtpmap:8 PCMA/8000`（音频时钟），照抄会把 25 fps 的流
+  算成 2.22 fps。MPEG-PS 的 PTS 单位由容器规范固定，与 rtpmap 无关。
+- **同一路 PS 里会混有音频 PES**（`ps_h265_1080p` 有 646 个，stream_id `0xC0`
+  段）。解复用必须按长度跳过它们，只把 `0xE0..0xEF` 的载荷拼进视频访问单元；
+  这份样本是第一份音频占比可观的真机流，正好验证了这条路径。
 
 ## 踩坑记录
 
