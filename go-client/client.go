@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -186,6 +187,18 @@ func clone(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
+}
+
+// jsonKeys returns the sorted top-level keys of a decoded JSON object, for
+// the Verbose log of text messages this client does not act on. Sorted so
+// that the same message always logs the same line, whatever the map order.
+func jsonKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // streamEvent is one unit of work handed from the socket read loop to the
@@ -561,7 +574,17 @@ func (c *HikMediaClient) run(ctx context.Context) error {
 					// Recover the SDP-like stream description and expose it to
 					// callers (codec, clock rate, width/height from SPS).
 					emit(streamEvent{kind: evInfo, info: ParseSDP(sdp)})
+				} else if c.Config.Verbose {
+					// Still discarded — but silently discarding it also made
+					// it impossible to tell whether the proxy ever pushes
+					// anything else on this channel (a status frame while the
+					// PTZ moves, say). Only the key set and the size are
+					// logged: values on this channel may carry session
+					// credentials, and the shape is what answers the question.
+					log.Printf("Text msg (no errorCode/sdp): %d bytes keys=%v", len(payload), jsonKeys(resp))
 				}
+			} else if c.Config.Verbose {
+				log.Printf("Text msg (not JSON): %d bytes", len(payload))
 			}
 
 		} else if msgType == websocket.BinaryMessage {
@@ -594,13 +617,28 @@ func (c *HikMediaClient) run(ctx context.Context) error {
 					}
 					return err
 				case MsgTypeKeepAlive:
-					// keepalive — discard
+					// keepalive — discard. Logged under Verbose so that a
+					// census of "everything that arrived in this window" can
+					// be complete; a type missing from the log would be
+					// indistinguishable from a type that never arrived.
+					if c.Config.Verbose {
+						log.Printf("Protocol msg 0x06 keepalive: %d bytes", len(pData))
+					}
 				default:
 					// Unknown protocol type (e.g. 0x00 stream metadata) —
 					// discard, matching Python which has no handler for
 					// unmatched msg_types.
+					//
+					// The head of the payload is logged with it: knowing only
+					// that "some 0x07 arrived" cannot tell you whether the
+					// message carried device state, and the tokens are single
+					// use, so there is no second chance to look.
 					if c.Config.Verbose {
-						log.Printf("Protocol msg 0x%02x: %d bytes (discarded)", pType, len(pData))
+						head := pData
+						if len(head) > 16 {
+							head = head[:16]
+						}
+						log.Printf("Protocol msg 0x%02x: %d bytes (discarded) head=%x", pType, len(pData), head)
 					}
 				}
 
