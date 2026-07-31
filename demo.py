@@ -3,10 +3,10 @@
 海康威视 WebSocket 客户端演示程序
 
 Usage:
-    python3 demo.py "wss://ipcbasehkvideolj.example.com.com:6014/proxy/[fd00:0:2c0:9::10c]:559/openUrl/mYqWpMI" --username admin --password ""
+    python3 demo.py "wss://example.com:6014/proxy/[1111::2222]:559/openUrl/auth_token" --username admin --password ""
     
     # 或者直接使用媒体端点
-    python3 demo.py --host ipcbasehkvideolj.example.com.com --port 6014 --device-ip "[fd00:0:2c0:9::10c]" --device-port 559
+    python3 demo.py --host example.com --port 6014 --device-ip "[1111::2222]" --device-port 559
 """
 
 import asyncio
