@@ -1,0 +1,11 @@
+v=0
+s=hikvision
+c=IN IP4 0.0.0.0
+a=range:npt=now-
+t=0 0
+m=video 0 RTP/AVP 0
+c=IN IP4 0.0.0.0
+a=rtpmap:0 /0
+a=control:trackID=0
+a=range:npt=now-
+a=Media_header:MEDIAINFO=494D4B48000000000200000100000110401F000000FA000000000000000000000000000000000000;

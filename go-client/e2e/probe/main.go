@@ -54,11 +54,12 @@ func main() {
 	signal.Notify(sig, os.Interrupt)
 	go func() { <-sig; cancel() }()
 
-	s := &stats{}
+	s := &stats{start: time.Now()}
 	client := hikws.NewHikMediaClient(config)
 	client.OnMediaInfo = func(mi *hikws.MediaInfo) {
 		s.mu.Lock()
 		s.info = mi
+		s.mark(&s.tInfo)
 		s.mu.Unlock()
 		log.Printf("MEDIAINFO: container=%q codec=%q clock=%d paramsets=%d",
 			mi.Container, mi.Codec, mi.ClockRate, len(mi.ParameterSets))
@@ -68,6 +69,7 @@ func main() {
 	// bug offline.
 	client.OnRawVideo = func(b []byte) {
 		s.mu.Lock()
+		s.mark(&s.tRaw)
 		s.raw.Write(b)
 		s.mu.Unlock()
 	}
@@ -79,7 +81,12 @@ func main() {
 		s.mu.Unlock()
 	}
 	client.OnVideoFrame = s.frame
-	client.OnError = func(e error) { log.Printf("ERROR: %v", e) }
+	client.OnError = func(e error) {
+		s.mu.Lock()
+		s.errs = append(s.errs, e.Error())
+		s.mu.Unlock()
+		log.Printf("ERROR: %v", e)
+	}
 
 	if err := client.Stream(ctx); err != nil {
 		log.Printf("stream ended: %v", err)
@@ -103,11 +110,26 @@ type stats struct {
 	codec                      string
 	minPTS, maxPTS             int64
 	havePTS                    bool
+
+	// Latency milestones, measured from the moment Stream is called: the
+	// stream is only usable once a frame comes out, so "connected" is not
+	// the number that matters to a caller.
+	start               time.Time
+	tInfo, tRaw, tFrame time.Duration
+	errs                []string
+}
+
+// mark records a milestone the first time it happens. Caller holds s.mu.
+func (s *stats) mark(d *time.Duration) {
+	if *d == 0 {
+		*d = time.Since(s.start)
+	}
 }
 
 func (s *stats) frame(meta *hikws.FrameMeta, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.mark(&s.tFrame)
 	s.frames++
 	s.esBytes += len(data)
 	if meta.IsKeyFrame {
@@ -151,6 +173,9 @@ func (s *stats) summarize() string {
 	fmt.Fprintf(&b, "keyframes   : %d\n", s.keyframes)
 	fmt.Fprintf(&b, "rawBytes    : %d\n", s.raw.Len())
 	fmt.Fprintf(&b, "esBytes     : %d\n", s.esBytes)
+	fmt.Fprintf(&b, "latency     : mediainfo=%dms firstByte=%dms firstFrame=%dms\n",
+		s.tInfo.Milliseconds(), s.tRaw.Milliseconds(), s.tFrame.Milliseconds())
+	fmt.Fprintf(&b, "errors      : %d %v\n", len(s.errs), s.errs)
 	if s.ptsSeen > 1 && clock > 0 && s.maxPTS > s.minPTS {
 		span := s.maxPTS - s.minPTS
 		fps := float64(s.ptsSeen-1) * float64(clock) / float64(span)

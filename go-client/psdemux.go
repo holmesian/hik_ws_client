@@ -7,6 +7,7 @@ import (
 
 // MPEG-PS start code IDs (the byte after the 00 00 01 prefix).
 const (
+	psEndCode     = 0xB9 // program end; the lowest ID the container uses
 	psPackStart   = 0xBA // pack header — starts a new access unit
 	psSystemStart = 0xBB // system header; PSM/PES all sort above this
 	pesVideoFirst = 0xE0

@@ -224,3 +224,78 @@ func TestPSDemux_DropsPartialLeadingAU(t *testing.T) {
 		t.Fatalf("PTS = %d, want 7200 (PTS leaked from the dropped tail)", got[0].PTS)
 	}
 }
+
+// A live stream is joined wherever the encoder happens to be, so the first
+// message can open on any packet of the container, not only a pack header. One
+// audio-heavy camera in the fleet opens on an audio PES: requiring 00 00 01 ba
+// classified it as a non-PS stream and delivered raw transport chunks as
+// frames for the whole session.
+func TestIsPSData(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+		want bool
+	}{
+		{"pack header", []byte{0x00, 0x00, 0x01, 0xba, 0x44}, true},
+		{"program end", []byte{0x00, 0x00, 0x01, 0xb9}, true},
+		{"system header", []byte{0x00, 0x00, 0x01, 0xbb, 0x00, 0x06}, true},
+		{"program stream map", []byte{0x00, 0x00, 0x01, 0xbc, 0x00, 0x12}, true},
+		{"audio pes", []byte{0x00, 0x00, 0x01, 0xc0, 0x00, 0xad}, true},
+		{"video pes", []byte{0x00, 0x00, 0x01, 0xe0, 0x00, 0x9c}, true},
+		// An annex-b NAL header always has its top bit clear, so a bare
+		// elementary stream can never be mistaken for the container.
+		{"annex-b idr", []byte{0x00, 0x00, 0x01, 0x65, 0x88}, false},
+		{"annex-b sps", []byte{0x00, 0x00, 0x01, 0x67, 0x64}, false},
+		{"h265 vps", []byte{0x00, 0x00, 0x01, 0x40, 0x01}, false},
+		{"not a start code", []byte{0x80, 0x60, 0x18, 0x5c}, false},
+		{"too short", []byte{0x00, 0x00, 0x01}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPSData(tc.in); got != tc.want {
+				t.Errorf("isPSData(% x) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// 82 of 94 cameras in the fleet interleave a private_stream_1 (0xBD) PES into
+// the video program roughly once per second. Its payload is opaque (an 80-byte
+// encrypted blob) and it carries a PTS of its own, so treating it as video
+// both splices garbage into the bitstream and dates the frame wrong — and the
+// frame/keyframe counts stay correct throughout, which is exactly the class of
+// corruption that stays invisible in a summary.
+//
+// The packet below is a verbatim capture, not a helper-built one: a helper
+// that shares the implementation's idea of a PES header cannot prove the
+// implementation reads a real one correctly.
+func TestPSDemux_SkipsPrivateStream(t *testing.T) {
+	private := []byte{
+		0x00, 0x00, 0x01, 0xbd, 0x00, 0x6a, // start code + length 106
+		0x8c, 0x80, 0x07, 0x27, 0x9a, 0x07, 0xf7, 0x19, 0xff, 0xf8, // PES header, PTS present
+		0x00, 0x02, 0x00, 0x17, 0x00, 0x01, 0x80, 0x00, 0x00, 0xff, 0x00, 0x00, 0xe0, 0xf1, 0xf0, 0x50,
+		0x1d, 0x12, 0xf2, 0xf5, 0xee, 0xba, 0x71, 0xf3, 0xfc, 0xb6, 0x0f, 0x1b, 0x73, 0x66, 0x65, 0xd9,
+		0x76, 0xb5, 0xff, 0xf7, 0x7a, 0xa5, 0xa1, 0xeb, 0xc7, 0xd4, 0x92, 0x7d, 0x14, 0x51, 0xba, 0x3b,
+		0xfa, 0x5d, 0x69, 0x7f, 0xb6, 0x49, 0x3e, 0x9d, 0xae, 0x71, 0x02, 0x48, 0x5f, 0x57, 0xfb, 0x40,
+		0xfa, 0x5d, 0x69, 0x7f, 0xb6, 0x49, 0x3e, 0x9d, 0xae, 0x71, 0x02, 0x48, 0x5f, 0x57, 0xfb, 0x40,
+		0x79, 0x6f, 0xe1, 0xc9, 0xa9, 0x21, 0xc7, 0xfa, 0x04, 0x72, 0xf7, 0x26, 0xdc, 0x2e, 0x97, 0xcf,
+	}
+	idr := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21}
+
+	d := &psDemuxer{}
+	var got []psFrame
+	got = append(got, d.Feed(psPack())...)
+	got = append(got, d.Feed(private)...)
+	got = append(got, d.Feed(psVideoPES(idr, 7200))...)
+	got = append(got, d.Flush()...)
+
+	if len(got) != 1 {
+		t.Fatalf("frames = %d, want 1", len(got))
+	}
+	if !bytes.Equal(got[0].Data, idr) {
+		t.Fatalf("payload = %x, want %x (private payload spliced into the ES)", got[0].Data, idr)
+	}
+	if got[0].PTS != 7200 {
+		t.Fatalf("PTS = %d, want 7200 (PTS taken from the private packet)", got[0].PTS)
+	}
+}

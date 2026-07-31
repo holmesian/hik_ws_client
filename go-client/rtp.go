@@ -65,51 +65,67 @@ func rtpStrip(b []byte) []byte {
 // key frame counts and recovered resolution were all still correct, and only a
 // strict PS structure walk revealed the holes.
 //
-// So the decision comes from two consecutive messages instead. RTP carries a
+// So the decision comes from a pair of messages instead. RTP carries a
 // constant SSRC and a sequence number that advances by one; container bytes
 // agree on all 48 of those bits only by an accident no real stream reaches.
-// The first message is held until the second arrives, then both are released
-// down whichever path was chosen.
+//
+// The pair must not be required to be adjacent. A WebSocket message boundary
+// is not an RTP packet boundary: on the HVAG camera family the proxy delivers
+// the first 8204-byte packet as 8192 bytes plus a 12-byte tail, so message two
+// is the middle of a packet and fails the header check. Requiring adjacency
+// therefore locked a genuinely RTP session onto the bare path for its whole
+// lifetime, splicing every 12-byte header into the bitstream. The first few
+// messages are held instead, and the pair is looked for among them.
 type rtpDetector struct {
 	decided bool
 	isRTP   bool
-	held    []byte
+	held    [][]byte
 }
 
-// feed returns the payloads ready for processing: none while the first message
-// is held, then both once the session has been classified.
+// rtpProbeMessages bounds the hold: after this many messages with no matching
+// pair the session is bare, and the held bytes are released untouched.
+const rtpProbeMessages = 4
+
+// feed returns the payloads ready for processing: none while messages are
+// held, then all of them at once when the session is classified.
 func (d *rtpDetector) feed(b []byte) [][]byte {
 	if d.decided {
 		return [][]byte{d.apply(b)}
 	}
-	if d.held == nil {
+	if len(d.held) == 0 && !rtpHeaderPlausible(b) {
 		// A first message that cannot be RTP settles it immediately, which is
 		// the common case: bare PS opens on 0x00.
-		if !rtpHeaderPlausible(b) {
-			d.decided = true
-			return [][]byte{b}
-		}
-		d.held = append([]byte(nil), b...)
+		d.decided = true
+		return [][]byte{b}
+	}
+	d.held = append(d.held, append([]byte(nil), b...))
+	d.isRTP = rtpPairFound(d.held)
+	if !d.isRTP && len(d.held) < rtpProbeMessages {
 		return nil
 	}
 	d.decided = true
-	d.isRTP = rtpHeaderPlausible(b) && rtpConsecutive(d.held, b)
-	first := d.held
-	d.held = nil
-	return [][]byte{d.apply(first), d.apply(b)}
+	return d.release()
 }
 
-// flush releases a held message when the session ends before a second one
-// arrived. With only one message there is no sequence to check, so it is
-// treated as not RTP: passing the bytes through leaves a recoverable stream,
-// while stripping a header that was never there does not.
+// flush releases the held messages when the session ends before the detector
+// reached a verdict. Without a confirming pair there is no sequence to check,
+// so they are treated as not RTP: passing the bytes through leaves a
+// recoverable stream, while stripping a header that was never there does not.
 func (d *rtpDetector) flush() [][]byte {
-	if d.held == nil {
+	if len(d.held) == 0 {
 		return nil
 	}
-	b := d.held
-	d.held, d.decided = nil, true
-	return [][]byte{b}
+	d.decided = true
+	return d.release()
+}
+
+func (d *rtpDetector) release() [][]byte {
+	out := make([][]byte, 0, len(d.held))
+	for _, h := range d.held {
+		out = append(out, d.apply(h))
+	}
+	d.held = nil
+	return out
 }
 
 func (d *rtpDetector) apply(b []byte) []byte {
@@ -124,13 +140,34 @@ func rtpHeaderPlausible(b []byte) bool {
 	return len(b) >= rtpFixedHeader && b[0]>>6 == 2
 }
 
-// rtpConsecutive reports whether b follows a as the next packet of one RTP
-// stream: same SSRC, sequence number one higher (wrapping at 16 bits).
+// rtpPairFound reports whether the held messages contain two RTP packets of
+// one stream. Messages that are mid-packet fragments simply fail the header
+// check and are skipped, so only the earlier of the two must be a packet
+// start — the pair does not have to be adjacent in the message list.
+func rtpPairFound(msgs [][]byte) bool {
+	for i := range msgs {
+		if !rtpHeaderPlausible(msgs[i]) {
+			continue
+		}
+		for j := i + 1; j < len(msgs); j++ {
+			if rtpHeaderPlausible(msgs[j]) && rtpConsecutive(msgs[i], msgs[j]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rtpConsecutive reports whether b is a later packet of the same RTP stream as
+// a: same SSRC, and a sequence number ahead of it by at most the probe window.
+// The gap allows for the packets that message fragmentation hid in between;
+// bounding it keeps the 48-bit coincidence a container would need out of reach.
 func rtpConsecutive(a, b []byte) bool {
 	if !bytes.Equal(a[8:12], b[8:12]) {
 		return false
 	}
 	seqA := binary.BigEndian.Uint16(a[2:4])
 	seqB := binary.BigEndian.Uint16(b[2:4])
-	return seqB == seqA+1
+	gap := seqB - seqA // wraps at 16 bits, as the sequence number does
+	return gap >= 1 && int(gap) <= rtpProbeMessages
 }
