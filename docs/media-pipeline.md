@@ -132,3 +132,32 @@ RTP 解包或容器解析。带元信息的回调是 Go `OnVideoFrame` / Python 
 下游（DataStation `wails-video-ai`）**不得自行重做这一层**——DataStation `ADR-0030` 已把字节级
 解析收敛到本库。理由就是本文列出的这些缺陷：它们全都不报错，只有画面是坏的，重写一遍等于把
 真机摸底的结论丢掉。
+
+## 内存复用是各自语言的事，不是解析行为
+
+Go 侧按 128 路 profile 做过两处缓冲复用（`closeAU` 交出精确尺寸拷贝并保留累加器容量、
+读循环用复用的 `bytes.Buffer` 取代 `ReadMessage` 并对交付净荷 `clone`）。**这两处不需要同步
+改 Python**，已逐字节核验（2026-07-31）：
+
+| Go | Python 对应实现 | 结论 |
+| --- | --- | --- |
+| `psdemux.go` `closeAU` | `hik_media.py` `_close_au` | 早已是精确尺寸拷贝：`bytes(self._au)` 交付、`self._au` 重置 |
+| `client.go` 读循环 + `clone()` | `hik_ws_client.py` `_parse_ws_frame` / `receive_message` | 早已交付独立副本：净荷是 `bytes(data[...])`，剩余字节留在 `self.buffer` |
+
+两处 Go 改动是把 Go **对齐到 Python 既有的行为**，不是反过来。三条依据：
+
+- **交付字节完全相同。** 四份样本各自回放，把每个访问单元按 `PTS|HasPTS|len|字节` 串接取
+  sha256，两侧独立计算后逐位相同（`ps_h265_720p` `8fd4cb2d…`、`ps_h265_1080p` `a1d47ce6…`、
+  `ps_h264_720p` `0d7c338d…`、`ps_h264_1080p` `943a5923…`）。这比两侧各自断言帧数/关键帧数
+  更强——本仓库撞过的每个解析缺陷都是"数字全对、字节是坏的"。
+  > 解析行为**合法**变更时这组摘要会变，届时必须两侧同时重算并确认仍相同。
+- **Go 的分配病理在 CPython 里不存在。** Go `append` 按 2 倍扩容，累加器从 nil 重新长起来会
+  产生约 4 倍码流大小的中间缓冲；CPython 的 `bytearray` 扩容因子是 **1.125**，且
+  `bytearray.clear()` 同样**不保留容量**（实测 `getsizeof` 100057 → 57），所以
+  `self._au = bytearray()` 与任何"复用"写法在 CPython 里等价，改了也换不来 Go 那笔收益。
+- **`clone()` 在 Python 里没有对应物可加。** `_parse_ws_frame` 交出去的是不可变 `bytes`，与
+  读缓冲彻底脱钩；实测把 `self.buffer` 原地清零，已交付的净荷不受影响。Go 需要 `clone` 只是
+  因为它改用了会被下次读覆盖的复用缓冲。
+
+推论（供后续改动参照）：**分配策略属于单侧工程设施，与"两侧同时改"的解析行为不是一回事。**
+判据只有一条——是否改变交付给调用方的字节；不改变就不必同步，改变就必须同步且两侧回放样本。
