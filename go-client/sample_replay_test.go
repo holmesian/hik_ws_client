@@ -60,6 +60,7 @@ var samples = []struct {
 	{dir: "../samples/ps_h265_720p", codec: "H265", frames: 611, keys: 25, width: 1280, height: 720, spsNAL: 33},
 	{dir: "../samples/ps_h265_1080p", codec: "H265", frames: 614, keys: 13, width: 1920, height: 1080, spsNAL: 33},
 	{dir: "../samples/ps_h264_720p", codec: "H264", frames: 655, keys: 26, width: 1280, height: 720, spsNAL: 7},
+	{dir: "../samples/ps_h264_1080p", codec: "H264", frames: 199, keys: 8, width: 1920, height: 1080, spsNAL: 7},
 }
 
 // TestReplaySamples replays each archived MPEG-PS capture through the demuxer
@@ -80,6 +81,12 @@ func TestReplaySamples(t *testing.T) {
 					t.Skipf("sample %s not present", path)
 				}
 				t.Fatal(err)
+			}
+			// Samples live in Git LFS. Without `git lfs pull` the file is
+			// present but holds a pointer, which would derail the walk below
+			// at offset 0 — a confusing failure for a missing download.
+			if bytes.HasPrefix(raw, []byte("version https://git-lfs")) {
+				t.Skipf("sample %s is an unfetched LFS pointer; run `git lfs pull`", path)
 			}
 
 			// Structure first. The demuxer resyncs on the next pack header,
