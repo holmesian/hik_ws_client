@@ -2,10 +2,50 @@ package hikws
 
 import (
 	"bytes"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// strictWalkPS walks an MPEG-PS stream element by element without ever
+// resyncing: each element must begin exactly where the previous one ended. It
+// returns the number of elements consumed and the offset it derailed at, or -1
+// when it reached the end of the buffer cleanly.
+//
+// This is deliberately stricter than psDemuxer, which scans forward for the
+// next pack header. That scan makes the demuxer robust against packet loss —
+// and makes packet loss invisible, because the frame counts still come out
+// right. Only a non-resyncing walk can tell a whole stream from a holed one.
+func strictWalkPS(b []byte) (int, int) {
+	i, n := 0, 0
+	for i < len(b) {
+		if i+4 > len(b) || b[i] != 0 || b[i+1] != 0 || b[i+2] != 1 {
+			return n, i
+		}
+		var size int
+		switch id := b[i+3]; {
+		case id == 0xBA: // pack header: 14 bytes + stuffing
+			if i+14 > len(b) {
+				return n, i
+			}
+			size = 14 + int(b[i+13]&7)
+		case id == 0xB9: // program end
+			size = 4
+		default: // system header, PSM, PES — all length-prefixed
+			if i+6 > len(b) {
+				return n, i
+			}
+			size = 6 + int(binary.BigEndian.Uint16(b[i+4:i+6]))
+		}
+		if i+size > len(b) {
+			return n, i
+		}
+		i += size
+		n++
+	}
+	return n, -1
+}
 
 // samples lists the archived real-device captures. They are the whole reason
 // they were collected: synthetic tests only prove the parser is
@@ -40,6 +80,16 @@ func TestReplaySamples(t *testing.T) {
 					t.Skipf("sample %s not present", path)
 				}
 				t.Fatal(err)
+			}
+
+			// Structure first. The demuxer resyncs on the next pack header,
+			// so it happily produces the right number of frames from a
+			// stream that has bytes missing or transport headers spliced in
+			// — that is how RTP de-encapsulation bugs stayed invisible in
+			// both directions. A strict walk does not resync: every element
+			// must begin exactly where the previous one ended.
+			if n, derail := strictWalkPS(raw); derail >= 0 {
+				t.Fatalf("strict PS walk derailed at %d/%d after %d elements", derail, len(raw), n)
 			}
 
 			// Feed in 16KiB chunks so access units are split across calls the

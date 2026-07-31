@@ -56,6 +56,9 @@ type HikMediaClient struct {
 	// stream paths; containerKnown records that the choice has been made.
 	ps             *psDemuxer
 	containerKnown bool
+	// rtp classifies the session's transport once, before the container is
+	// looked at; some proxies tunnel the container inside RTP.
+	rtp rtpDetector
 	// frameCount / startTime drive the synthetic per-frame timestamp.
 	frameCount int
 	startTime  time.Time
@@ -204,13 +207,20 @@ func (c *HikMediaClient) dispatch(e streamEvent) {
 	}
 }
 
-// feedVideo routes a video payload to the caller. It first strips any RTP
-// encapsulation, then, when the stream is an MPEG-PS container, demuxes the
-// payload into access units — the device splits a single NAL across PES
-// packets, so raw PS bytes cannot be scanned as annex-b. For every other
-// container the payload is delivered verbatim.
+// feedVideo routes a video payload to the caller. The RTP detector may hold
+// the first message back until it can classify the session, so one call can
+// release zero, one or two payloads.
 func (c *HikMediaClient) feedVideo(data []byte) {
-	data = rtpPayload(data)
+	for _, p := range c.rtp.feed(data) {
+		c.feedContainer(p)
+	}
+}
+
+// feedContainer handles one de-encapsulated payload. When the stream is an
+// MPEG-PS container it is demuxed into access units — the device splits a
+// single NAL across PES packets, so raw PS bytes cannot be scanned as
+// annex-b. For every other container the payload is delivered verbatim.
+func (c *HikMediaClient) feedContainer(data []byte) {
 	if c.OnRawVideo != nil {
 		c.OnRawVideo(data)
 	}
@@ -310,9 +320,14 @@ func (c *HikMediaClient) deliverFrame(data []byte, pts int64, hasPTS bool) {
 	c.OnVideoData(data)
 }
 
-// flushPS delivers the last access unit still buffered in the demuxer,
-// which closes on stream end (see psDemuxer.Flush).
+// flushPS releases anything still buffered when the stream ends: a payload the
+// RTP detector was holding for classification, then the last access unit in
+// the demuxer (see psDemuxer.Flush). Order matters — the held payload has to
+// reach the demuxer before the demuxer is closed.
 func (c *HikMediaClient) flushPS() {
+	for _, p := range c.rtp.flush() {
+		c.feedContainer(p)
+	}
 	if c.ps == nil {
 		return
 	}
@@ -383,7 +398,7 @@ func (c *HikMediaClient) session(ctx context.Context) error {
 	// A new session brings a new SDP and a fresh container; whatever the
 	// dead connection left half-demuxed must not be spliced onto it.
 	c.mediaInfo = nil
-	c.ps, c.containerKnown = nil, false
+	c.ps, c.containerKnown, c.rtp = nil, false, rtpDetector{}
 	return c.run(ctx)
 }
 
