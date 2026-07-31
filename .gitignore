@@ -10,3 +10,7 @@ output
 frames
 
 hik_ws_demo
+
+# 摸底时 probe 的一次性输出目录；粘贴的 OA 凭证文件
+.probe-scratch
+*.curl
