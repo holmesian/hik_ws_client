@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // HikConfig represents the connection configuration for the Hikvision device.
@@ -23,6 +24,26 @@ type HikConfig struct {
 	// every video/audio frame would otherwise emit a log line, which
 	// dominates I/O and allocates under multi-stream concurrency.
 	Verbose bool
+
+	// MaxReconnects is how many extra session attempts Stream makes after a
+	// transport failure (dropped connection, stall, dial error). 0 disables
+	// reconnection. Server-reported errors (expired token, bad credentials)
+	// are never retried — reconnecting with the same URL cannot fix them.
+	MaxReconnects int
+	// ReconnectWait is the base backoff between attempts; the Nth retry waits
+	// N*ReconnectWait. Defaults to 2s when zero.
+	ReconnectWait time.Duration
+	// StallTimeout aborts a session when no WebSocket message arrives within
+	// this window. This is the only way to detect a silently dropped stream:
+	// the proxy keeps the TCP connection open and simply stops sending media.
+	// 0 disables the watchdog.
+	StallTimeout time.Duration
+	// AsyncDelivery, when > 0, moves demuxing and the user callbacks off the
+	// socket read loop onto a worker fed by a buffered channel of this
+	// capacity. It pipelines parsing with reading, so a slow consumer no
+	// longer throttles the socket. Sends block when the buffer is full, so
+	// no media is ever silently dropped.
+	AsyncDelivery int
 }
 
 // ParseProxyURL parses a Hikvision proxy URL to extract the configuration.

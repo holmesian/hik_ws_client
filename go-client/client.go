@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -15,10 +17,29 @@ import (
 
 // keepaliveInterval is how often a WebSocket ping is sent to keep the
 // session alive; keepaliveWriteWait bounds each control-frame write.
-const (
+// They are vars so tests can shorten them.
+var (
 	keepaliveInterval  = 20 * time.Second
 	keepaliveWriteWait = 5 * time.Second
+	dialTimeout        = 10 * time.Second
 )
+
+// ServerError is an error the proxy reported in-band (expired openUrl token,
+// bad credentials, device unreachable). It is terminal: retrying the same URL
+// produces the same code, so Stream stops instead of reconnecting.
+type ServerError struct {
+	Code int
+	Msg  string
+}
+
+func (e *ServerError) Error() string {
+	return fmt.Sprintf("server error code=%d msg=%s", e.Code, e.Msg)
+}
+
+// ErrStalled is returned when no message arrived within Config.StallTimeout.
+// The socket stays open when a camera stops publishing, so this watchdog is
+// what turns a silent stream drop into a reconnect.
+var ErrStalled = errors.New("stream stalled: no data within StallTimeout")
 
 type HikMediaClient struct {
 	Config     *HikConfig
@@ -30,6 +51,10 @@ type HikMediaClient struct {
 
 	// mediaInfo is recovered from the SDP the server returns on realplay.
 	mediaInfo *MediaInfo
+	// ps demuxes the MPEG-PS container the cameras actually send. It is
+	// allocated lazily on the first PS payload and stays nil for the raw
+	// elementary stream (RTP/RAW container) paths.
+	ps *psDemuxer
 	// frameCount / startTime drive the synthetic per-frame timestamp.
 	frameCount int
 	startTime  time.Time
@@ -40,6 +65,8 @@ type HikMediaClient struct {
 	OnError      func(error)              // transport / session errors
 	OnMediaInfo  func(*MediaInfo)         // SDP-like stream description (realplay)
 	OnVideoFrame func(*FrameMeta, []byte) // per-frame metadata + payload
+	OnRawVideo   func([]byte)             // raw container payload, before PS demux (diagnostics)
+	OnSPS        func([]byte)             // first in-stream SPS NAL (start code + header), for archiving
 
 	mu sync.Mutex
 }
@@ -59,6 +86,9 @@ func (c *HikMediaClient) buildMediaURL() string {
 func (c *HikMediaClient) Connect(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		// Without this the handshake can hang forever on a black-holed
+		// network, which would also hang the reconnect loop.
+		HandshakeTimeout: dialTimeout,
 	}
 
 	url := c.buildMediaURL()
@@ -87,6 +117,12 @@ func (c *HikMediaClient) Close() error {
 
 // Authenticate reads the first message expecting PKD and rand
 func (c *HikMediaClient) Authenticate() error {
+	// Bound the handshake read: a proxy that accepts the socket but never
+	// answers would otherwise block the session forever.
+	if d := c.Config.StallTimeout; d > 0 {
+		c.conn.SetReadDeadline(time.Now().Add(d))
+		defer c.conn.SetReadDeadline(time.Time{})
+	}
 	msgType, msg, err := c.conn.ReadMessage()
 	if err != nil {
 		return err
@@ -131,7 +167,145 @@ func (c *HikMediaClient) Realplay() error {
 
 	reqBytes, _ := json.Marshal(reqData)
 	log.Printf("Sending realplay request to %s", deviceURL)
+	c.conn.SetWriteDeadline(time.Now().Add(keepaliveWriteWait))
+	defer c.conn.SetWriteDeadline(time.Time{})
 	return c.conn.WriteMessage(websocket.TextMessage, reqBytes)
+}
+
+// streamEvent is one unit of work handed from the socket read loop to the
+// delivery path. Routing media info through the same queue as the media
+// itself keeps mediaInfo single-owner in async mode.
+type streamEvent struct {
+	kind byte
+	data []byte
+	info *MediaInfo
+}
+
+const (
+	evVideo byte = 'v'
+	evAudio byte = 'a'
+	evInfo  byte = 'm'
+)
+
+func (c *HikMediaClient) dispatch(e streamEvent) {
+	switch e.kind {
+	case evVideo:
+		c.feedVideo(e.data)
+	case evAudio:
+		if c.OnAudioData != nil {
+			c.OnAudioData(e.data)
+		}
+	case evInfo:
+		c.mediaInfo = e.info
+		if c.OnMediaInfo != nil {
+			c.OnMediaInfo(e.info)
+		}
+	}
+}
+
+// feedVideo routes a video payload to the caller. When the stream is an
+// MPEG-PS container (recovered from the SDP MEDIAINFO header, or detected
+// heuristically from a PS pack start), the payload is demuxed into access
+// units first — the device splits a single NAL across PES packets, so the
+// raw PS bytes cannot be scanned as annex-b. For every other container the
+// payload is delivered verbatim.
+func (c *HikMediaClient) feedVideo(data []byte) {
+	if c.OnRawVideo != nil {
+		c.OnRawVideo(data)
+	}
+	demux := false
+	if c.mediaInfo != nil && c.mediaInfo.Container == "PS" {
+		demux = true
+	} else if c.mediaInfo == nil && isPSData(data) {
+		demux = true
+	}
+	if !demux {
+		c.deliverFrame(data, 0, false)
+		return
+	}
+	if c.ps == nil {
+		c.ps = &psDemuxer{}
+	}
+	for _, f := range c.ps.Feed(data) {
+		c.deliverFrame(f.Data, f.PTS, f.HasPTS)
+	}
+}
+
+// isPSData reports whether b begins with an MPEG-PS pack header
+// (00 00 01 ba), used to demux streams whose SDP has not arrived yet.
+func isPSData(b []byte) bool {
+	return len(b) >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] == psPackStart
+}
+
+// deliverFrame recovers the per-frame metadata and hands the payload to the
+// caller. OnVideoFrame takes precedence over OnVideoData to avoid delivering
+// the same payload twice; OnVideoData alone keeps working for existing
+// callers. When hasPTS is true the container's real 90kHz PTS is used;
+// otherwise a synthetic, order-preserving PTS is synthesized from arrival
+// time. Resolution is recovered from an in-stream SPS when the MEDIAINFO
+// header (which carries none) left it unknown.
+func (c *HikMediaClient) deliverFrame(data []byte, pts int64, hasPTS bool) {
+	if c.OnVideoFrame == nil && c.OnVideoData == nil {
+		return
+	}
+	if c.startTime.IsZero() {
+		c.startTime = time.Now()
+	}
+	c.frameCount++
+
+	codec := ""
+	if c.mediaInfo != nil {
+		codec = c.mediaInfo.Codec
+	}
+	// Recover resolution from the in-stream SPS (the MEDIAINFO header has
+	// none). This fills Width/Height for PS streams on the first key frame.
+	if codec != "" && (c.mediaInfo == nil || c.mediaInfo.Width == 0) {
+		if w, h, sps, ok := recoverResolution(data, codec); ok {
+			if c.mediaInfo != nil {
+				c.mediaInfo.Width, c.mediaInfo.Height = w, h
+			}
+			if c.OnSPS != nil && sps != nil {
+				c.OnSPS(sps)
+			}
+		}
+	}
+
+	elapsed := time.Since(c.startTime)
+	meta := &FrameMeta{
+		FrameIndex:  c.frameCount,
+		IsKeyFrame:  AnalyzeFrame(data, codec),
+		Codec:       codec,
+		TimestampMs: elapsed.Milliseconds(),
+	}
+	if hasPTS {
+		meta.PTS = pts
+		meta.HasPTS = true
+	} else if c.mediaInfo != nil && c.mediaInfo.ClockRate > 0 {
+		meta.PTS = int64(elapsed.Seconds() * float64(c.mediaInfo.ClockRate))
+	}
+	if c.mediaInfo != nil {
+		meta.Width, meta.Height = c.mediaInfo.Width, c.mediaInfo.Height
+	}
+	if c.Config.Verbose {
+		log.Printf("Video frame #%d: %d bytes (key=%v, codec=%s)", meta.FrameIndex, len(data), meta.IsKeyFrame, codec)
+	}
+
+	if c.OnVideoFrame != nil {
+		c.OnVideoFrame(meta, data)
+		return
+	}
+	c.OnVideoData(data)
+}
+
+// flushPS delivers the last access unit still buffered in the demuxer,
+// which closes on stream end (see psDemuxer.Flush).
+func (c *HikMediaClient) flushPS() {
+	if c.ps == nil {
+		return
+	}
+	for _, f := range c.ps.Flush() {
+		c.deliverFrame(f.Data, f.PTS, f.HasPTS)
+	}
 }
 
 // Run processes incoming messages until context is cancelled or connection drops.
@@ -142,9 +316,65 @@ func (c *HikMediaClient) Realplay() error {
 //   - If unpack succeeds with a known type → handle by type.
 //   - If unpack succeeds with an unknown type → discard (matches Python).
 //   - If unpack fails → treat the rest of the frame as raw video (matches Python).
+//
 // Per-frame logging is gated behind Config.Verbose to avoid log/alloc storms
 // under multi-stream concurrency.
 func (c *HikMediaClient) Run(ctx context.Context) {
+	_ = c.run(ctx)
+}
+
+// Stream owns the whole session lifecycle — connect, authenticate, realplay,
+// receive — and rebuilds it after a transport failure (dropped connection,
+// stalled stream, dial error) up to Config.MaxReconnects times. It returns
+// nil on a clean shutdown (context cancelled or stream ended) and the last
+// error otherwise. A *ServerError is terminal and stops the loop immediately.
+func (c *HikMediaClient) Stream(ctx context.Context) error {
+	wait := c.Config.ReconnectWait
+	if wait <= 0 {
+		wait = 2 * time.Second
+	}
+	for attempt := 0; ; attempt++ {
+		err := c.session(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err == nil {
+			return nil
+		}
+		var srv *ServerError
+		if errors.As(err, &srv) || attempt >= c.Config.MaxReconnects {
+			return err
+		}
+		backoff := time.Duration(attempt+1) * wait
+		log.Printf("session failed (%v), reconnecting in %s", err, backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// session runs exactly one connect→receive cycle and always closes the socket.
+func (c *HikMediaClient) session(ctx context.Context) error {
+	if err := c.Connect(ctx); err != nil {
+		return err
+	}
+	defer c.Close()
+	if err := c.Authenticate(); err != nil {
+		return fmt.Errorf("authenticate: %w", err)
+	}
+	if err := c.Realplay(); err != nil {
+		return fmt.Errorf("realplay: %w", err)
+	}
+	// A new session brings a new SDP and a fresh container; whatever the
+	// dead connection left half-demuxed must not be spliced onto it.
+	c.mediaInfo = nil
+	c.ps = nil
+	return c.run(ctx)
+}
+
+func (c *HikMediaClient) run(ctx context.Context) error {
 	// Close the underlying connection when context is cancelled so that
 	// ReadMessage unblocks immediately (the select+default pattern alone
 	// cannot interrupt a blocking ReadMessage). The done channel makes the
@@ -152,6 +382,38 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 	conn := c.conn
 	done := make(chan struct{})
 	defer close(done)
+	// Flush the final buffered access unit when the stream ends.
+	defer c.flushPS()
+
+	// Delivery path: synchronous by default, pipelined through a worker when
+	// AsyncDelivery is configured. Everything the caller observes goes
+	// through the same channel, so ordering is identical in both modes and
+	// mediaInfo is only ever touched by one goroutine.
+	emit := c.dispatch
+	if n := c.Config.AsyncDelivery; n > 0 {
+		ch := make(chan streamEvent, n)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for e := range ch {
+				c.dispatch(e)
+			}
+		}()
+		emit = func(e streamEvent) {
+			select {
+			case ch <- e:
+			case <-ctx.Done():
+			}
+		}
+		// Runs before the deferred flushPS above (LIFO), so the worker has
+		// drained by the time the demuxer is flushed.
+		defer func() {
+			close(ch)
+			wg.Wait()
+		}()
+	}
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -181,16 +443,28 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 	}()
 
 	for {
+		// Re-armed before every read: any message resets the watchdog, so
+		// this fires only when the proxy goes silent while holding the
+		// socket open — the signature of a dropped camera stream.
+		if d := c.Config.StallTimeout; d > 0 {
+			conn.SetReadDeadline(time.Now().Add(d))
+		}
 		msgType, payload, err := conn.ReadMessage()
 		if err != nil {
 			// Context cancellation is not an error
 			if ctx.Err() != nil {
-				return
+				return nil
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				err = ErrStalled
+			} else {
+				err = fmt.Errorf("read error: %w", err)
 			}
 			if c.OnError != nil {
-				c.OnError(fmt.Errorf("read error: %w", err))
+				c.OnError(err)
 			}
-			return
+			return err
 		}
 
 		if msgType == websocket.TextMessage {
@@ -199,22 +473,23 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 				code, _ := resp["errorCode"].(float64)
 				if code != 0 {
 					msg, _ := resp["errorMsg"].(string)
-					errMsg := fmt.Sprintf("server error code=%.0f msg=%s", code, msg)
-					log.Print(errMsg)
+					srv := &ServerError{Code: int(code), Msg: msg}
+					log.Print(srv.Error())
 					if c.OnError != nil {
-						c.OnError(fmt.Errorf("%s", errMsg))
+						c.OnError(srv)
 					}
-			} else if sdp, ok := resp["sdp"].(string); ok && sdp != "" {
-				if c.Config.Verbose {
-					log.Printf("realplay OK, SDP length=%d", len(sdp))
+					// The proxy tears the session down right after this;
+					// keeping the loop alive only surfaced a confusing
+					// "close 1005" a moment later.
+					return srv
+				} else if sdp, ok := resp["sdp"].(string); ok && sdp != "" {
+					if c.Config.Verbose {
+						log.Printf("realplay OK, SDP length=%d", len(sdp))
+					}
+					// Recover the SDP-like stream description and expose it to
+					// callers (codec, clock rate, width/height from SPS).
+					emit(streamEvent{kind: evInfo, info: ParseSDP(sdp)})
 				}
-				// Recover the SDP-like stream description and expose it to
-				// callers (codec, clock rate, width/height from SPS).
-				c.mediaInfo = ParseSDP(sdp)
-				if c.OnMediaInfo != nil {
-					c.OnMediaInfo(c.mediaInfo)
-				}
-			}
 			}
 
 		} else if msgType == websocket.BinaryMessage {
@@ -230,58 +505,22 @@ func (c *HikMediaClient) Run(ctx context.Context) {
 					if c.Config.Verbose {
 						log.Printf("Raw video frame: %d bytes", len(buf))
 					}
-					if c.OnVideoData != nil {
-						c.OnVideoData(buf)
-					}
+					emit(streamEvent{kind: evVideo, data: buf})
 					break
 				}
 
 				pType, pData := msg.Type, msg.Payload
 				switch pType {
 				case MsgTypeVideoData:
-					if c.startTime.IsZero() {
-						c.startTime = time.Now()
-					}
-					c.frameCount++
-					codec := ""
-					if c.mediaInfo != nil {
-						codec = c.mediaInfo.Codec
-					}
-					isKey := AnalyzeFrame(pData, codec)
-					elapsed := time.Since(c.startTime)
-					meta := &FrameMeta{
-						FrameIndex:  c.frameCount,
-						IsKeyFrame:  isKey,
-						Codec:       codec,
-						TimestampMs: elapsed.Milliseconds(),
-					}
-					if c.mediaInfo != nil {
-						meta.Width, meta.Height = c.mediaInfo.Width, c.mediaInfo.Height
-						if c.mediaInfo.ClockRate > 0 {
-							meta.PTS = int64(elapsed.Seconds() * float64(c.mediaInfo.ClockRate))
-						}
-					}
-					if c.Config.Verbose {
-						log.Printf("Protocol video frame: %d bytes (key=%v, codec=%s)", len(pData), isKey, codec)
-					}
-					// OnVideoFrame gives metadata + payload; when it is set
-					// we use it instead of OnVideoData to avoid delivering
-					// the same payload twice. OnVideoData still fires for
-					// callers that only register the raw-payload callback.
-					if c.OnVideoFrame != nil {
-						c.OnVideoFrame(meta, pData)
-					} else if c.OnVideoData != nil {
-						c.OnVideoData(pData)
-					}
+					emit(streamEvent{kind: evVideo, data: pData})
 				case MsgTypeAudioData:
-					if c.OnAudioData != nil {
-						c.OnAudioData(pData)
-					}
+					emit(streamEvent{kind: evAudio, data: pData})
 				case MsgTypeSessionError:
+					err := fmt.Errorf("session error: %s", string(pData))
 					if c.OnError != nil {
-						c.OnError(fmt.Errorf("session error: %s", string(pData)))
+						c.OnError(err)
 					}
-					return
+					return err
 				case MsgTypeKeepAlive:
 					// keepalive — discard
 				default:

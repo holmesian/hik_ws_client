@@ -3,6 +3,7 @@ package hikws
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strconv"
@@ -17,17 +18,23 @@ import (
 type MediaInfo struct {
 	// SDP is the original SDP string returned by the server.
 	SDP string
-	// Codec is the media codec, e.g. "H264" or "H265".
+	// Container is the payload encapsulation, taken from the Hikvision
+	// MEDIAINFO header: "PS" (MPEG program stream — what the cameras
+	// actually send), "RTP", "GB", "HIK" or "RAW". Empty means the SDP
+	// carried no MEDIAINFO header, and the payload is treated as a bare
+	// elementary stream.
+	Container string
+	// Codec is the media codec, "H264" or "H265".
 	Codec string
-	// ClockRate is the RTP clock rate (typically 90000 for H.26x).
+	// ClockRate is the timestamp clock rate (90000 for H.26x).
 	ClockRate int
-	// Width/Height are recovered from the SPS carried in
-	// sprop-parameter-sets (H.264). They are 0 when not available
-	// (e.g. H.265 SPS parsing is out of scope for this pass, or the
-	// SDP omits sprop-parameter-sets).
+	// Width/Height are recovered from the SPS. The MEDIAINFO header
+	// carries no resolution, so on a PS stream they stay 0 until the
+	// first SPS has been seen in the bitstream.
 	Width  int
 	Height int
-	// ParameterSets holds the base64 SPS/PPS from sprop-parameter-sets.
+	// ParameterSets holds the base64 SPS/PPS from sprop-parameter-sets,
+	// for the standard RTP-style SDP that carries them.
 	ParameterSets []string
 }
 
@@ -36,18 +43,25 @@ type MediaInfo struct {
 // always read what is available.
 func ParseSDP(sdp string) *MediaInfo {
 	info := &MediaInfo{SDP: sdp}
+	mediaHeader := ""
 	for _, line := range strings.Split(sdp, "\n") {
 		line = strings.TrimSpace(line)
 		switch {
+		case strings.HasPrefix(line, "a=Media_header:MEDIAINFO="):
+			mediaHeader = strings.TrimSuffix(
+				strings.TrimPrefix(line, "a=Media_header:MEDIAINFO="), ";")
 		case strings.HasPrefix(line, "a=rtpmap:"):
-			// a=rtpmap:96 H264/90000
+			// a=rtpmap:96 H264/90000 — the cameras send "a=rtpmap:0 /0",
+			// which names no codec; only take fields that are present.
 			fields := strings.SplitN(line, " ", 2)
 			if len(fields) != 2 {
 				continue
 			}
 			spec := fields[1]
 			parts := strings.SplitN(spec, "/", 2)
-			info.Codec = strings.ToUpper(parts[0])
+			if parts[0] != "" {
+				info.Codec = strings.ToUpper(parts[0])
+			}
 			if len(parts) == 2 {
 				if r, err := strconv.Atoi(parts[1]); err == nil {
 					info.ClockRate = r
@@ -69,19 +83,77 @@ func ParseSDP(sdp string) *MediaInfo {
 				}
 			}
 			if info.Codec == "H264" && len(info.ParameterSets) > 0 {
-				if w, h, err := parseH264SPS(info.ParameterSets[0]); err == nil {
-					info.Width, info.Height = w, h
+				if raw, err := base64.StdEncoding.DecodeString(info.ParameterSets[0]); err == nil {
+					if w, h, err := parseH264SPSBytes(raw); err == nil {
+						info.Width, info.Height = w, h
+					}
 				}
 			}
 		}
 	}
+
+	// The MEDIAINFO header is authoritative for container and codec and
+	// overrides rtpmap, which the cameras leave blank.
+	applyMediaHeader(info, mediaHeader)
+	if info.Container == "PS" && info.ClockRate == 0 {
+		info.ClockRate = 90000 // PS timestamps are 90kHz by definition
+	}
 	return info
+}
+
+// applyMediaHeader decodes the 40-byte Hikvision "IMKH" header carried in
+// a=Media_header:MEDIAINFO=<hex>. Only the container and codec fields are
+// read; the header carries no resolution (h5player takes that from the
+// decoder), and the audio fields have no consumer here.
+func applyMediaHeader(info *MediaInfo, hexStr string) {
+	raw, err := hex.DecodeString(strings.TrimSpace(hexStr))
+	if err != nil || len(raw) < 12 || string(raw[:4]) != "IMKH" {
+		return
+	}
+	switch [2]byte{raw[8], raw[9]} {
+	case [2]byte{1, 0}:
+		info.Container = "HIK"
+	case [2]byte{2, 0}:
+		info.Container = "PS"
+	case [2]byte{4, 0}:
+		info.Container = "RTP"
+	case [2]byte{8, 0}:
+		info.Container = "GB"
+	case [2]byte{16, 0}:
+		info.Container = "RAW"
+	}
+	switch [2]byte{raw[10], raw[11]} {
+	case [2]byte{1, 0}, [2]byte{0, 1}:
+		info.Codec = "H264"
+	case [2]byte{5, 0}:
+		info.Codec = "H265"
+	}
 }
 
 // bitReader is a minimal big-endian bit reader for SPS parsing.
 type bitReader struct {
 	data []byte
 	pos  int // bit offset
+}
+
+// stripEmulationPrevention removes H.264/H.265 NAL emulation-prevention bytes:
+// a 0x03 that follows 00 00 in the escaped RBSP must be dropped before any
+// bit-level parsing. Without this, every field after the first 00 00 0x
+// sequence in the SPS is read at the wrong bit offset and the parsed resolution
+// is garbage (e.g. 2x1 instead of 1280x720). The encoder only ever inserts 03
+// after 00 00, so any 03 in that position is an EPB, never real data.
+func stripEmulationPrevention(b []byte) []byte {
+	if len(b) < 3 {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if i >= 2 && b[i] == 3 && b[i-1] == 0 && b[i-2] == 0 {
+			continue
+		}
+		out = append(out, b[i])
+	}
+	return out
 }
 
 func (b *bitReader) readBit() (int, error) {
@@ -149,11 +221,18 @@ func parseH264SPS(b64 string) (int, int, error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	return parseH264SPSBytes(raw)
+}
+
+// parseH264SPSBytes decodes width/height from an already-decoded H.264 SPS
+// NAL unit (including its 1-byte NAL header).
+func parseH264SPSBytes(raw []byte) (int, int, error) {
 	if len(raw) < 2 {
 		return 0, 0, fmt.Errorf("sps too short")
 	}
-	// Skip the 1-byte NAL header (forbidden_zero | nal_ref_idc | nal_unit_type).
-	br := &bitReader{data: raw[1:]}
+	// Skip the 1-byte NAL header, then strip emulation-prevention bytes before
+	// bit parsing.
+	br := &bitReader{data: stripEmulationPrevention(raw[1:])}
 
 	profileIdc, err := br.readBits(8)
 	if err != nil {
@@ -318,6 +397,182 @@ func parseH264SPS(b64 string) (int, int, error) {
 	return width, height, nil
 }
 
+// parseH265SPS decodes the width/height from an H.265 (HEVC) SPS NAL unit
+// (including its 1-byte NAL header). Only the fields needed for resolution
+// are read: pic_width/height_in_luma_samples plus the conformance window.
+func parseH265SPS(raw []byte) (int, int, error) {
+	if len(raw) < 3 {
+		return 0, 0, fmt.Errorf("h265 sps too short")
+	}
+	// Skip the 2-byte HEVC NAL header, then strip emulation-prevention bytes
+	// before bit parsing (a real SPS is full of 00 00 03 sequences).
+	br := &bitReader{data: stripEmulationPrevention(raw[2:])}
+
+	// sps_video_parameter_set_id u(4), sps_max_sub_layers_minus1 u(3),
+	// sps_temporal_id_nesting_flag u(1)
+	if _, err := br.readBits(4); err != nil {
+		return 0, 0, err
+	}
+	maxSubLayersMinus1, err := br.readBits(3)
+	if err != nil {
+		return 0, 0, err
+	}
+	if _, err = br.readBit(); err != nil { // temporal_id_nesting_flag
+		return 0, 0, err
+	}
+
+	// profile_tier_level(1, maxSubLayersMinus1)
+	if _, err = br.readBits(8); err != nil { // profile_space(2)+tier(1)+profile_idc(5)
+		return 0, 0, err
+	}
+	if _, err = br.readBits(32); err != nil { // profile_compatibility flags
+		return 0, 0, err
+	}
+	if _, err = br.readBits(48); err != nil { // constraint indicators
+		return 0, 0, err
+	}
+	if _, err = br.readBits(8); err != nil { // general_level_idc
+		return 0, 0, err
+	}
+	if maxSubLayersMinus1 > 0 {
+		var subProfile, subLevel int
+		for i := 0; i < int(maxSubLayersMinus1); i++ {
+			p, err := br.readBit()
+			if err != nil {
+				return 0, 0, err
+			}
+			subProfile = (subProfile << 1) | p
+			l, err := br.readBit()
+			if err != nil {
+				return 0, 0, err
+			}
+			subLevel = (subLevel << 1) | l
+		}
+		// reserved_zero_2bits for the remaining sub-layers
+		if _, err = br.readBits(2 * (8 - int(maxSubLayersMinus1))); err != nil {
+			return 0, 0, err
+		}
+		for i := 0; i < int(maxSubLayersMinus1); i++ {
+			if (subProfile>>uint(int(maxSubLayersMinus1)-1-i))&1 == 1 {
+				if _, err = br.readBits(8 + 32 + 48 + 8); err != nil {
+					return 0, 0, err
+				}
+			}
+			if (subLevel>>uint(int(maxSubLayersMinus1)-1-i))&1 == 1 {
+				if _, err = br.readBits(8); err != nil {
+					return 0, 0, err
+				}
+			}
+		}
+	}
+
+	if _, err = br.readUE(); err != nil { // sps_seq_parameter_set_id
+		return 0, 0, err
+	}
+	chromaFormatIdc, err := br.readUE()
+	if err != nil {
+		return 0, 0, err
+	}
+	if chromaFormatIdc == 3 {
+		if _, err = br.readBit(); err != nil { // separate_colour_plane_flag
+			return 0, 0, err
+		}
+	}
+	picWidth, err := br.readUE()
+	if err != nil {
+		return 0, 0, err
+	}
+	picHeight, err := br.readUE()
+	if err != nil {
+		return 0, 0, err
+	}
+	confWinFlag, err := br.readBit()
+	if err != nil {
+		return 0, 0, err
+	}
+	cropLeft, cropRight, cropTop, cropBottom := 0, 0, 0, 0
+	if confWinFlag == 1 {
+		if cropLeft, err = br.readUE(); err != nil {
+			return 0, 0, err
+		}
+		if cropRight, err = br.readUE(); err != nil {
+			return 0, 0, err
+		}
+		if cropTop, err = br.readUE(); err != nil {
+			return 0, 0, err
+		}
+		if cropBottom, err = br.readUE(); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	var subWC, subHC int
+	switch chromaFormatIdc {
+	case 1:
+		subWC, subHC = 2, 2
+	case 2:
+		subWC, subHC = 2, 1
+	default:
+		subWC, subHC = 1, 1
+	}
+	width := picWidth - (cropLeft+cropRight)*subWC
+	height := picHeight - (cropTop+cropBottom)*subHC
+	if width <= 0 || height <= 0 || width > 8192 || height > 8192 {
+		return 0, 0, fmt.Errorf("implausible h265 dimensions %dx%d", width, height)
+	}
+	return width, height, nil
+}
+
+// recoverResolution scans an annex-b elementary stream (one access unit) for
+// the SPS NAL unit and decodes its width/height. It returns ok=false when no
+// SPS is present or it cannot be parsed. The PS container delivers the stream
+// in annex-b form, so this recovers the resolution the MEDIAINFO header lacks.
+// On success sps holds the matched SPS NAL (including its start code and header)
+// so the caller can archive it for debugging.
+func recoverResolution(data []byte, codec string) (int, int, []byte, bool) {
+	if codec == "" {
+		return 0, 0, nil, false
+	}
+	isH265 := codec == "H265"
+	spsType := byte(7) // H.264 SPS
+	if isH265 {
+		spsType = 33 // H.265 SPS_NUT
+	}
+	i := 0
+	for i < len(data) {
+		idx := bytes.Index(data[i:], []byte{0, 0, 1})
+		if idx < 0 {
+			break
+		}
+		pos := i + idx
+		nalPos := pos + 3
+		if nalPos >= len(data) {
+			break
+		}
+		b := data[nalPos]
+		var t int
+		if isH265 {
+			t = int(b>>1) & 0x3F
+		} else {
+			t = int(b & 0x1F)
+		}
+		if t == int(spsType) {
+			sps := data[pos:] // start code + NAL, the canonical unit to archive
+			if isH265 {
+				if w, h, err := parseH265SPS(sps[3:]); err == nil {
+					return w, h, sps, true
+				}
+			} else {
+				if w, h, err := parseH264SPSBytes(sps[3:]); err == nil {
+					return w, h, sps, true
+				}
+			}
+		}
+		i = nalPos + 1
+	}
+	return 0, 0, nil, false
+}
+
 // FrameMeta describes a single recovered video frame. The elementary
 // stream carries no DTS/PTS, so PTS/TimestampMs are synthesized from the
 // arrival time and the SDP clock rate; they give callers a monotonic,
@@ -328,18 +583,19 @@ type FrameMeta struct {
 	Codec       string
 	Width       int
 	Height      int
-	PTS         int64 // clock-rate units, synthetic (arrival-based)
+	PTS         int64 // container PTS (90kHz) when HasPTS; else synthetic (arrival-based)
+	HasPTS      bool  // true when PTS comes from the container, false for synthetic
 	TimestampMs int64 // wall-clock ms since stream start
 }
 
 // AnalyzeFrame scans an H.264/H.265 annex-b frame for NAL units and reports
-// whether it contains an IDR/key NAL. The codec is required because H.264 and
+// whether it contains a key NAL. The codec is required because H.264 and
 // H.265 NAL type fields overlap (e.g. a H.264 SPS byte also decodes as a H.265
 // VPS type), so the SDP-recovered codec is used to disambiguate: when codec is
-// "H265" the H.265 IDR types (19/20) are checked, otherwise the H.264 IDR
+// "H265" any IRAP NAL (types 16-21) marks a key frame, otherwise the H.264 IDR
 // type (5) is used. It assumes the data begins with a NAL (optionally preceded
-// by a 00 00 00 01 or 00 00 01 start code), which is the case for the raw
-// elementary stream this client delivers.
+// by a 00 00 00 01 or 00 00 01 start code), which is the case for the payload
+// the PS demuxer and the raw elementary stream deliver.
 func AnalyzeFrame(data []byte, codec string) bool {
 	isH265 := codec == "H265"
 	i := 0
@@ -357,7 +613,8 @@ func AnalyzeFrame(data []byte, codec string) bool {
 		b := data[nalPos]
 		if isH265 {
 			t := int(b>>1) & 0x3F
-			if t == 19 || t == 20 { // IDR_W_DLP / IDR_N_LP
+			// IRAP NAL units (IDR/CRA) are decodable without prior frames.
+			if t >= 16 && t <= 21 {
 				return true
 			}
 		} else {
