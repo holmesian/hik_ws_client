@@ -131,8 +131,9 @@ grep -rIn -Ei '<你的域名>|openUrl/[A-Za-z0-9]{5,}' samples/ | head
 ## 改完解析代码的固定动作
 
 ```bash
-cd go-client && go build ./... && go vet ./... && go test -count=1 -race ./...
-python3 -m unittest test_hik_media                # 仓库根，Python 侧
+# 仓库根执行
+(cd go-client && go build ./... && go vet ./... && go test -count=1 -race ./...)
+(cd python-client && python3 -m unittest test_hik_media)
 ```
 
 两侧都会回放 `samples/` 并断言同一组帧数 / 关键帧数 / 分辨率。**样本全绿证明不了没见过的

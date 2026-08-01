@@ -1,9 +1,10 @@
 ---
 adr: 0002
 title: 线格式以码流为准，SDP 仅作提示；一次性判定必须跨消息互证
-status: Proposed
+status: Accepted
 date: 2026-07-31
-deciders: DataStation 架构师；待项目 owner 确认
+accepted: 2026-08-01
+deciders: 项目 owner
 related_rules: media-parsing.md
 related_docs: samples/README.md, docs/media-pipeline.md
 ---
@@ -12,7 +13,7 @@ related_docs: samples/README.md, docs/media-pipeline.md
 
 ## 状态（Status）
 
-`Proposed`——记录的是已落地并经 123 台真机验证的既成行为。确认后置 `Accepted`。
+`Accepted`（2026-08-01 由项目 owner 确认）——记录的是已落地并经 123 台真机验证的既成行为。
 
 ## 背景与问题（Context）
 

@@ -1,19 +1,20 @@
 ---
 adr: 0003
 title: 真机样本库（Git LFS）+ 严格结构走查作为验收基线
-status: Proposed
+status: Accepted
 date: 2026-07-31
-deciders: DataStation 架构师；待项目 owner 确认
+accepted: 2026-08-01
+deciders: 项目 owner
 related_rules: testing.md
-related_docs: samples/README.md, go-client/sample_replay_test.go, test_hik_media.py
+related_docs: samples/README.md, go-client/sample_replay_test.go, python-client/test_hik_media.py
 ---
 
 # ADR-0003 真机样本库（Git LFS）+ 严格结构走查作为验收基线
 
 ## 状态（Status）
 
-`Proposed`——记录的是已落地的既成做法（4 份样本已入 LFS，两侧回放测试已存在）。确认后置
-`Accepted`。
+`Accepted`（2026-08-01 由项目 owner 确认）——记录的是已落地的既成做法（4 份样本已入 LFS，
+两侧回放测试已存在）。
 
 ## 背景与问题（Context）
 

@@ -129,9 +129,8 @@ RTP 载荷里装的是 MPEG-PS，**不要给它加 Annex-B 起始码**。
 RTP 解包或容器解析。带元信息的回调是 Go `OnVideoFrame` / Python `on_frame`；诊断用
 `OnRawVideo`（解复用**前**的容器字节，抓包归档用）与 `OnSPS`。
 
-下游（DataStation `wails-video-ai`）**不得自行重做这一层**——DataStation `ADR-0030` 已把字节级
-解析收敛到本库。理由就是本文列出的这些缺陷：它们全都不报错，只有画面是坏的，重写一遍等于把
-真机摸底的结论丢掉。
+调用方**不应自行重做这一层**。理由就是本文列出的这些缺陷：它们全都不报错，只有画面是坏的，
+重写一遍等于把真机摸底的结论丢掉。
 
 ## 内存复用是各自语言的事，不是解析行为
 
@@ -141,8 +140,8 @@ Go 侧按 128 路 profile 做过两处缓冲复用（`closeAU` 交出精确尺�
 
 | Go | Python 对应实现 | 结论 |
 | --- | --- | --- |
-| `psdemux.go` `closeAU` | `hik_media.py` `_close_au` | 早已是精确尺寸拷贝：`bytes(self._au)` 交付、`self._au` 重置 |
-| `client.go` 读循环 + `clone()` | `hik_ws_client.py` `_parse_ws_frame` / `receive_message` | 早已交付独立副本：净荷是 `bytes(data[...])`，剩余字节留在 `self.buffer` |
+| `go-client/psdemux.go` `closeAU` | `python-client/hik_media.py` `_close_au` | 早已是精确尺寸拷贝：`bytes(self._au)` 交付、`self._au` 重置 |
+| `go-client/client.go` 读循环 + `clone()` | `python-client/hik_ws_client.py` `_parse_ws_frame` / `receive_message` | 早已交付独立副本：净荷是 `bytes(data[...])`，剩余字节留在 `self.buffer` |
 
 两处 Go 改动是把 Go **对齐到 Python 既有的行为**，不是反过来。三条依据：
 

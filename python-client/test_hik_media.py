@@ -21,7 +21,10 @@ import unittest
 
 import hik_media as m
 
-SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
+# 样本库在仓库根，Go 与 Python 两侧共用同一份，断言同一组数字。
+SAMPLES = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "samples"
+)
 
 
 # ---------------------------------------------------------------------------

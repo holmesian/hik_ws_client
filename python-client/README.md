@@ -1,19 +1,31 @@
-# Python 客户端
+# python-client
 
-Python 侧是**分析与研究工具**；生产取流用 [go-client](../go-client/README.md)。两套实现共用
-同一套解析逻辑，Go 为行为基准（ADR-0001）。
+海康 WebSocket 取流的 Python 实现，定位是**分析与研究工具**；生产取流用
+[go-client](../go-client/README.md)。两套实现共用同一套解析逻辑，Go 为行为基准
+（[ADR-0001](../.codebuddy/adr/ADR-0001-transport-media-split-and-dual-implementation.md)）。
 
-- `hik_ws_client.py`：传输层（WebSocket、鉴权、封包、重连）
-- `hik_media.py`：媒体解析层，**仅依赖标准库**
+协议细节见 [../docs/protocol.md](../docs/protocol.md)，字节级管线见
+[../docs/media-pipeline.md](../docs/media-pipeline.md)。
+
+## 文件
+
+| 文件 | 职责 |
+| --- | --- |
+| `hik_ws_client.py` | 传输层：WebSocket、鉴权、封包、重连 |
+| `hik_media.py` | 媒体解析层，**仅依赖标准库** |
+| `test_hik_media.py` | 回归测试 + `../samples/` 样本回放 |
+| `demo.py` | 命令行演示：取流、统计、存帧 |
+| `play.py` | FFmpeg 解码 + OpenCV 实时显示 |
 
 ## 安装
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt      # 只有 pycryptodome（AES/RSA），媒体层不需要
+pip install -r requirements.txt
 ```
 
-Python 3.8+。
+Python 3.8+。`hik_media.py` 不需要任何依赖；`hik_ws_client.py` 需要 pycryptodome
+（AES/RSA），`play.py` 另需 opencv-python 与 numpy。
 
 ## 命令行
 
@@ -67,15 +79,16 @@ timestamp_ms`。`has_pts` 为真时 `pts` 是容器给的 90kHz 时间戳，否�
 
 ## 播放与解码
 
-客户端交付的是完整的 Annex-B 访问单元，可直接喂解码器；本仓库不内置解码（ADR-0004）。
-`play.py` 就是把 `on_video_data` 收到的访问单元写进 ffmpeg 的 stdin、读回 MJPEG 显示——
-自己接解码器时同理，不需要再做 RTP 解包或容器解析。
+客户端交付的是完整的 Annex-B 访问单元，可直接喂解码器；本库不内置解码
+（[ADR-0004](../.codebuddy/adr/ADR-0004-component-scope-boundary.md)）。`play.py` 就是把
+`on_video_data` 收到的访问单元写进 ffmpeg 的 stdin、读回 MJPEG 显示——自己接解码器时同理，
+不需要再做 RTP 解包或容器解析。
 
 ## 测试
 
 ```bash
-python3 -m unittest test_hik_media -v
+cd python-client && python3 -m unittest test_hik_media -v
 ```
 
-回放 `samples/` 的真机采集并断言与 Go 侧**同一组**帧数、关键帧数、分辨率。先
+回放仓库根 `samples/` 的真机采集并断言与 Go 侧**同一组**帧数、关键帧数、分辨率。先在仓库根
 `git lfs pull`，否则用例 skip（skip 等于没跑回归）。

@@ -8,20 +8,23 @@ alwaysApply: true
 海康威视 Web 私有 WebSocket 协议的**取流客户端库**：连上代理、鉴权、取流，把设备下发的
 传输字节还原成可直接喂解码器的 Annex-B 访问单元。
 
-它是 DataStation 生态里字节级解析的**唯一权威实现**（DataStation `ADR-0030`）。下游
-（`wails-video-ai` 等）不得自研 RTP / 容器 / 起始码解析——所以本仓库的解析缺陷会直接
-变成下游的画面损坏，改这里的代码要按"库"的标准要求自己，不是按脚本。
+它是一个**独立组件**，可被任意项目引用，仓库里不写任何具体调用方的业务上下文、内部路径或
+治理编号（`ADR-0005`）。调用方不应自研 RTP / 容器 / 起始码解析——本仓库的解析缺陷会直接
+变成调用方的画面损坏，改这里的代码要按"库"的标准要求自己，不是按脚本。
 
 ## 目录职责
 
+顶层是**两个并列的库** + 三类共享资产（`ADR-0005`）。
+
 | 路径 | 职责 | 约束 |
 | --- | --- | --- |
-| `hik_ws_client.py` | Python 传输层：WebSocket、鉴权、封包、重连 | 不做媒体解析 |
-| `hik_media.py` | Python 媒体解析层 | **仅标准库**，不引入第三方依赖 |
-| `go-client/` | Go 实现（传输 + 媒体），下游生产使用的就是它 | 见 `media-parsing.md` |
+| `go-client/` | Go 库（传输 + 媒体），生产使用的就是它，也是行为基准 | 见 `media-parsing.md`；目录名是 import path 的一部分，不改 |
 | `go-client/e2e/probe/` | 单路实链路探针：一次连接完成分析 + 归档 | 语义单一，别往里堆功能 |
-| `samples/` | 真机采集样本（Git LFS）与实测结论 | 见 `samples/README.md` |
-| `docs/` | 技术细节文档 | README 只做入口，细节一律在这里 |
+| `python-client/` | Python 库（分析与研究工具） | 与 Go 等价对齐，见下 |
+| `python-client/hik_ws_client.py` | Python 传输层：WebSocket、鉴权、封包、重连 | 不做媒体解析 |
+| `python-client/hik_media.py` | Python 媒体解析层 | **仅标准库**，不引入第三方依赖 |
+| `samples/` | 两侧共享：真机采集样本（Git LFS）与实测结论 | 见 `samples/README.md` |
+| `docs/` | 两侧共享：与语言无关的技术文档 | 语言相关的 API 文档进各自库的 README |
 | `.codebuddy/adr/` | 架构决策记录（宪法层） | 变更须经 owner 确认 |
 
 ## 双实现对齐
@@ -42,10 +45,11 @@ Go 与 Python 是**同一套解析逻辑的两个实现，Go 为准**。
 
 ## 文档结构
 
-- `README.md` 是**入口**：项目是什么、怎么跑起来、去哪看细节。不放协议字段表、不放字节级
-  分析过程。
-- 技术细节进 `docs/`：协议见 `docs/protocol.md`，媒体管线见 `docs/media-pipeline.md`，
-  Python API 见 `docs/python-api.md`，Go API 见 `go-client/README.md`。
+- 根 `README.md` 是**仓库入口**：项目是什么、两个库各是什么、怎么跑起来、去哪看细节。不放
+  协议字段表、不放字节级分析过程、不放某一侧的 API 细节。
+- 各库的 API 与用法进各自的 README：`go-client/README.md`、`python-client/README.md`。
+- 与语言无关的技术细节进 `docs/`：协议见 `docs/protocol.md`，媒体管线见
+  `docs/media-pipeline.md`。
 - **实测结论只写在 `samples/README.md`**，且必须标明是哪一轮摸底、多少台设备测出来的。
   推测与实测在这个项目里必须可区分——大量早期结论后来被真机推翻过。
 - 新增文档要在 README 的文档索引里登记，否则等于不存在。
@@ -56,7 +60,8 @@ Go 与 Python 是**同一套解析逻辑的两个实现，Go 为准**。
 
 - 代理主机名、设备内网地址（IPv4 / IPv6）；
 - openUrl token、Bearer token、Cookie、会话 ID；
-- 设备名称、部门名称等运营信息。
+- 设备名称、部门名称等运营信息；
+- 调用方项目的名称、内部路径与治理编号（`ADR-0005`）。
 
 示例一律用 `example.com` / `[1111::2222]` / `auth_token`。提交前自查：
 
