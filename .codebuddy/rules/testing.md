@@ -3,7 +3,7 @@ description: 验证规范——什么算证明解析正确，样本回放与真�
 alwaysApply: false
 globs:
   - "**/*_test.go"
-  - "test_hik_media.py"
+  - "python-client/test_hik_media.py"
   - "go-client/e2e/**"
   - "samples/**"
 ---
@@ -32,7 +32,8 @@ globs:
 `samples/`（Git LFS）里的四份真机采集覆盖 `{H.264, H.265} × {720p, 1080p}`，即全量摸底中 94 台
 出流设备的全部形态。
 
-- Go：`go-client/sample_replay_test.go`；Python：`test_hik_media.py`。两边断言**同一组**数值。
+- Go：`go-client/sample_replay_test.go`；Python：`python-client/test_hik_media.py`。两边断言
+  **同一组**数值。
 - 跑之前 `git lfs install && git lfs pull`。未拉取时用例会 skip——**skip 等于没跑回归**，CI 必须
   显式拉取。
 - 改任何解析逻辑（包括性能优化）后必须重跑，数值对不上就是改坏了。
@@ -65,11 +66,12 @@ globs:
 ## 第六条：常规命令
 
 ```bash
+# 仓库根执行
 # Go：竞态检测必须开
-cd go-client && go build ./... && go vet ./... && go test -count=1 -race ./...
+(cd go-client && go build ./... && go vet ./... && go test -count=1 -race ./...)
 
-# Python：仅标准库
-python3 -m unittest test_hik_media -v
+# Python：媒体层仅标准库
+(cd python-client && python3 -m unittest test_hik_media -v)
 ```
 
 新修复必须附带能复现该缺陷的回归用例；只改代码不加用例的修复视为未完成。

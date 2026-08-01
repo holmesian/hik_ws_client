@@ -3,8 +3,7 @@ description: 字节级解析硬约束（RTP / MPEG-PS / PES / Annex-B / SPS）�
 alwaysApply: false
 globs:
   - "go-client/**"
-  - "hik_media.py"
-  - "test_hik_media.py"
+  - "python-client/**"
 ---
 
 ## 适用范围

@@ -1,6 +1,7 @@
 # go-client
 
-海康 WebSocket 取流的 Go 实现，也是生产路径上使用的那一套（DataStation `ADR-0030`）。
+海康 WebSocket 取流的 Go 实现，也是生产路径上使用的那一套，并且是两套实现的行为基准
+（[ADR-0001](../.codebuddy/adr/ADR-0001-transport-media-split-and-dual-implementation.md)）。
 交付给调用方的是**解复用后的 Annex-B 访问单元**，调用方不需要再做 RTP 解包或容器解析。
 
 协议细节见 [../docs/protocol.md](../docs/protocol.md)，字节级管线见

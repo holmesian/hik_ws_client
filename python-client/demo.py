@@ -89,10 +89,10 @@ async def main():
         epilog="""
 Examples:
   # Using full URL
-  python3 demo.py "wss://example.com:6014/proxy/192.168.1.64:8000/openUrl/abc123"
+  python3 demo.py "wss://example.com:6014/proxy/[1111::2222]:559/openUrl/auth_token"
   
   # Using individual parameters
-  python3 demo.py --host example.com --port 6014 --device-ip 192.168.1.64 --device-port 8000
+  python3 demo.py --host example.com --port 6014 --device-ip "[1111::2222]" --device-port 559
         """
     )
     

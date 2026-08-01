@@ -1,9 +1,10 @@
 ---
 adr: 0004
 title: 组件边界——只做取流与解复用，不解码、不解密、不解析私有流、不做 PTZ
-status: Proposed
+status: Accepted
 date: 2026-07-31
-deciders: DataStation 架构师；待项目 owner 确认
+accepted: 2026-08-01
+deciders: 项目 owner
 related_rules: project.md, media-parsing.md
 related_docs: samples/README.md, docs/media-pipeline.md, docs/ptz-stream-observability.md
 ---
@@ -12,7 +13,7 @@ related_docs: samples/README.md, docs/media-pipeline.md, docs/ptz-stream-observa
 
 ## 状态（Status）
 
-`Proposed`——记录的是既成边界。确认后置 `Accepted`。
+`Accepted`（2026-08-01 由项目 owner 确认）——记录的是既成边界。
 
 ## 背景与问题（Context）
 
@@ -25,7 +26,8 @@ related_docs: samples/README.md, docs/media-pipeline.md, docs/ptz-stream-observa
   内容；B 型（12 台）跨设备跨时间**一个字节都不变**，是能力声明；C 型只有 1 台设备且不含
   位置；D 型全队列只出现一次。**没有球机坐标、转动角度或定位信息**，与 `h5player.min.js`
   的行为一致（官方播放器同样不解析 0xBD，PTZ 走设备 ISAPI/HTTP 接口）。
-- **解码**：`play.py` / `screenshot.go` 都是把访问单元原样喂 ffmpeg，本仓库不内置解码器。
+- **解码**：`python-client/play.py` / `go-client/screenshot.go` 都是把访问单元原样喂 ffmpeg，
+  本仓库不内置解码器。
 - **音频**：音频消息原样下发，未解 PES、未解码，目前无下游需求。
 - **云台可观测性**：上面的 `0xBD` 结论来自静置普查。补做的受控差分实测（转动期间实时抓同一
   条流，19 次采集 / 64 次转动 / 8 次静置对照）进一步确认：WS 文本、WS 二进制未知类型、`0xBD`、

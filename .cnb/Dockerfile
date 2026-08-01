@@ -39,7 +39,7 @@ RUN set -ex && \
 
 
 # 安装项目 Python 依赖（bookworm 的 pip 需要 --break-system-packages 装入系统环境）
-COPY requirements.txt /tmp/requirements.txt
+COPY python-client/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt \
     && rm -f /tmp/requirements.txt
 

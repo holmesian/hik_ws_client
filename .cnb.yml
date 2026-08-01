@@ -34,7 +34,7 @@ main:
         - docker
       ifModify:
         - .cnb/**
-        - requirements.txt
+        - python-client/requirements.txt
         - go-client/go.mod
         - go-client/go.sum
       stages:

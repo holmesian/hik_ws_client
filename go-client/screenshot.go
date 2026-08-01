@@ -16,7 +16,7 @@ import (
 // VideoSaver manages an ffmpeg process that decodes the video stream
 // into an MJPEG pipe, then periodically saves JPEG frames to disk.
 //
-// Matches the Python play.py approach:
+// Matches the python-client/play.py approach:
 //
 //	ffmpeg -hide_banner -sn -an -i pipe:0 -f image2pipe -vcodec mjpeg -v error pipe:1
 type VideoSaver struct {
@@ -42,7 +42,7 @@ func NewVideoSaver(ctx context.Context, outputDir, prefix string, intervalSecond
 
 	reader, writer := io.Pipe()
 
-	// Match Python play.py exactly — NO probesize/analyzeduration overrides
+	// Match python-client/play.py exactly — NO probesize/analyzeduration overrides
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-hide_banner",
 		"-sn", "-an",
