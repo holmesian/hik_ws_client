@@ -28,8 +28,6 @@ import socket
 import ssl
 import struct
 import time
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Optional
@@ -62,7 +60,13 @@ class HikConfig:
 
 
 class HikCrypto:
-    """海康威视加密工具类"""
+    """海康威视加密工具类
+
+    本类是全模块唯一依赖 pycryptodome 的地方，且只服务于鉴权握手；传输层
+    （帧解析、消息分发、重连）不碰加密。因此 AES/pad 采用惰性导入——放在用到
+    它们的方法内部，使本模块在未安装 pycryptodome 时仍可导入，传输层用例得以
+    无条件运行。运行真实连接时 pycryptodome 依然是必需依赖。
+    """
 
     # 海康固定 AES 密钥（JS 代码中硬编码）
     HIK_FIXED_KEY = bytes.fromhex('1234567891234567123456789123456712345678912345671234567891234567')
@@ -73,6 +77,9 @@ class HikCrypto:
         """
         AES-128-CBC PKCS7 加密（与 CryptoJS 兼容）
         """
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad
+
         key = bytes.fromhex(key_hex)
         iv = bytes.fromhex(iv_hex)
         pt = pad(plaintext.encode('utf-8'), AES.block_size)
@@ -149,6 +156,9 @@ class HikCrypto:
         生成 authorization 字段
         authorization = AES_Encrypt(rand + ':' + auth, key[:32], iv[:16])
         """
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad
+
         plaintext = f"{rand}:{auth}"
         key_bytes = bytes.fromhex(key[:64])
         iv_bytes = bytes.fromhex(iv[:32])
@@ -163,6 +173,9 @@ class HikCrypto:
         生成 token 字段
         token = AES_Encrypt(token_plain, key[:32], iv[:16])
         """
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad
+
         key_bytes = bytes.fromhex(key[:64])
         iv_bytes = bytes.fromhex(iv[:32])
         if len(key_bytes) < 32:
