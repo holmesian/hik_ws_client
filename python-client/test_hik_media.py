@@ -564,15 +564,15 @@ class TestReplaySamples(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 客户端接线（hik_ws_client 需要 pycryptodome / websockets，缺了就跳过）
+# 客户端接线
+#
+# hik_ws_client 顶层只依赖标准库与 hik_media：pycryptodome 由 HikCrypto 惰性导入，
+# 传输层不碰加密。所以这里无条件导入，下面的接线用例在任何环境都必须真正执行——
+# 一条会静默跳过的用例比没有更危险，它在报告里以 s 出现，看起来像有覆盖。
 # ---------------------------------------------------------------------------
-try:
-    from hik_ws_client import HikConfig, HikMediaClient
-except ImportError:  # pragma: no cover
-    HikMediaClient = None
+from hik_ws_client import HikConfig, HikMediaClient
 
 
-@unittest.skipIf(HikMediaClient is None, "缺少 pycryptodome/websockets，跳过客户端接线用例")
 class TestClientWiring(unittest.TestCase):
     """验证 HikMediaClient 把消息真的送过了 RTP 判定 → PS 解复用 → 帧交付这条链路。
 
@@ -684,7 +684,6 @@ class _EOFReader:
         return b""
 
 
-@unittest.skipIf(HikMediaClient is None, "缺少 pycryptodome/websockets，跳过客户端接线用例")
 class TestMultiMessageFrameWiring(unittest.TestCase):
     VIDEO = 0x40
     AUDIO = 0x41
