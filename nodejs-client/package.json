@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node bin/server.js",
     "demo": "node demo.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "verify": "node verify.mjs"
   },
   "keywords": [
     "hikvision",
