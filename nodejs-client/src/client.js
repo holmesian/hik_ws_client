@@ -142,7 +142,9 @@ export class HikMediaClient extends EventEmitter {
       const onMessage = (data, isBinary) => {
         if (isBinary) return;
         clearTimeout(timeout);
-        this.ws.off('message', onMessage);
+        // 连接可能在鉴权阶段已被其他消息处理器关闭（如服务端下发错误码），
+        // 此时 this.ws 已置空，仅在仍持有时移除监听，避免空引用崩溃。
+        if (this.ws) this.ws.off('message', onMessage);
 
         try {
           const resp = JSON.parse(data.toString('utf-8'));
