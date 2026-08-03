@@ -105,7 +105,7 @@ decoder.decode(new EncodedVideoChunk({
 ### 1. 启动转发服务器
 
 ```bash
-cd nodejs-hik-ws
+cd nodejs-client
 npm start
 ```
 

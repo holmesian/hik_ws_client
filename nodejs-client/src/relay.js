@@ -180,7 +180,13 @@ export class HikRelayServer {
 
     hikClient.on('error', (err) => {
       console.error(`[Session ${sessionId}] Error: ${err.message}`);
-      this._sendToClient(session, { type: 'error', cameraCode, message: err.message });
+      this._sendToClient(session, {
+        type: 'error',
+        cameraCode,
+        message: err.message,
+        serverError: !!err.isServerError,
+        code: err.code,
+      });
     });
 
     hikClient.on('close', () => {
@@ -200,7 +206,16 @@ export class HikRelayServer {
     hikClient.run().catch((err) => {
       console.error(`[Session ${sessionId}] Run error: ${err.message}`);
       this._sendToClient(session, { type: 'error', cameraCode, message: err.message });
-      clientWs.close(1011, err.message);
+
+      if (clientWs.readyState !== WebSocket.OPEN) return;
+
+      // ServerError 是代理上报的终态错误（token 过期/凭据错误/设备不可达）：
+      // 用 1008 优雅关断，避免误导性地以 1011 (内部错误) 关断——与 go-client 终态语义对齐。
+      if (err && err.isServerError) {
+        clientWs.close(1008, err.message);
+      } else {
+        clientWs.close(1011, err.message);
+      }
     });
   }
 
