@@ -1,0 +1,22 @@
+{
+  "cameras": [
+    {
+      "cameraCode": "cam001",
+      "proxyHost": "proxy.example.com",
+      "proxyPort": 6014,
+      "deviceIP": "192.168.1.64",
+      "devicePort": 8000,
+      "username": "admin",
+      "password": ""
+    },
+    {
+      "cameraCode": "cam002",
+      "proxyHost": "proxy.example.com",
+      "proxyPort": 6014,
+      "deviceIP": "[fd00:0:2c0:9::10c]",
+      "devicePort": 559,
+      "username": "admin",
+      "password": ""
+    }
+  ]
+}

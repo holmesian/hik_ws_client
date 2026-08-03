@@ -1,0 +1,27 @@
+{
+  "name": "nodejs-hik-ws",
+  "version": "1.0.0",
+  "description": "Node.js Hikvision WebSocket Video Stream Relay Service",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bin/server.js",
+    "demo": "node demo.js",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "hikvision",
+    "websocket",
+    "video",
+    "stream",
+    "relay"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

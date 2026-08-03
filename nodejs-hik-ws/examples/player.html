@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>海康威视直播播放器</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f0f23;
+      color: #fff;
+      min-height: 100vh;
+    }
+    .header {
+      background: linear-gradient(135deg, #1a1a3e, #0f0f23);
+      padding: 20px;
+      border-bottom: 1px solid #2a2a5e;
+    }
+    .header h1 {
+      font-size: 20px;
+      color: #00d4ff;
+    }
+    .main {
+      display: flex;
+      height: calc(100vh - 80px);
+    }
+    .sidebar {
+      width: 280px;
+      background: #1a1a3e;
+      border-right: 1px solid #2a2a5e;
+      padding: 20px;
+      overflow-y: auto;
+    }
+    .camera-list {
+      list-style: none;
+    }
+    .camera-item {
+      padding: 12px 16px;
+      margin-bottom: 8px;
+      background: #0f0f23;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.3s;
+      border: 1px solid transparent;
+    }
+    .camera-item:hover {
+      border-color: #00d4ff;
+      background: #1a1a4e;
+    }
+    .camera-item.active {
+      border-color: #00d4ff;
+      background: #1a1a4e;
+    }
+    .camera-item .code {
+      font-weight: 600;
+      color: #00d4ff;
+    }
+    .camera-item .status {
+      font-size: 12px;
+      color: #888;
+      margin-top: 4px;
+    }
+    .content {
+      flex: 1;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+    }
+    .video-wrapper {
+      flex: 1;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .video-placeholder {
+      text-align: center;
+      color: #666;
+    }
+    .video-placeholder .icon {
+      font-size: 80px;
+      margin-bottom: 20px;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      padding: 15px 0;
+    }
+    .btn {
+      padding: 10px 24px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      transition: all 0.3s;
+    }
+    .btn-play {
+      background: linear-gradient(135deg, #00d4ff, #0099cc);
+      color: #fff;
+    }
+    .btn-play:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 15px rgba(0, 212, 255, 0.4);
+    }
+    .btn-stop {
+      background: linear-gradient(135deg, #ff4757, #cc0033);
+      color: #fff;
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .info-bar {
+      display: flex;
+      gap: 20px;
+      padding: 10px 0;
+      font-size: 13px;
+      color: #888;
+    }
+    .info-bar span {
+      color: #00d4ff;
+    }
+    .log-panel {
+      height: 120px;
+      background: #0a0a1a;
+      border-radius: 8px;
+      padding: 10px;
+      overflow-y: auto;
+      font-family: 'Consolas', monospace;
+      font-size: 12px;
+      margin-top: 10px;
+    }
+    .log-entry {
+      padding: 2px 0;
+    }
+    .log-time { color: #666; }
+    .log-info { color: #00d4ff; }
+    .log-error { color: #ff4757; }
+    .log-success { color: #2ed573; }
+    .server-input {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 15px;
+      background: #0f0f23;
+      border: 1px solid #2a2a5e;
+      border-radius: 8px;
+      color: #fff;
+      font-size: 14px;
+    }
+    .section-title {
+      font-size: 12px;
+      color: #888;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+      letter-spacing: 1px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>海康威视直播播放器</h1>
+  </div>
+
+  <div class="main">
+    <div class="sidebar">
+      <div class="section-title">转发服务器</div>
+      <input type="text" class="server-input" id="serverUrl" value="ws://localhost:8080" placeholder="ws://localhost:8080">
+
+      <div class="section-title">摄像头列表</div>
+      <ul class="camera-list" id="cameraList">
+        <li class="camera-item" data-code="cam001">
+          <div class="code">cam001</div>
+          <div class="status">192.168.1.64:8000</div>
+        </li>
+        <li class="camera-item" data-code="cam002">
+          <div class="code">cam002</div>
+          <div class="status">[IPv6]:559</div>
+        </li>
+      </ul>
+
+      <div class="section-title">手动输入</div>
+      <input type="text" class="server-input" id="customCode" placeholder="输入 cameraCode 回车" onkeypress="if(event.key==='Enter')playCustom()">
+    </div>
+
+    <div class="content">
+      <div class="video-wrapper" id="videoWrapper">
+        <div class="video-placeholder" id="placeholder">
+          <div class="icon">📹</div>
+          <p>选择摄像头并点击播放</p>
+        </div>
+        <video id="videoPlayer" autoplay playsinline muted style="display: none;"></video>
+      </div>
+
+      <div class="controls">
+        <button class="btn btn-play" id="btnPlay" onclick="play()" disabled>▶ 播放</button>
+        <button class="btn btn-stop" id="btnStop" onclick="stop()" disabled>⏹ 停止</button>
+      </div>
+
+      <div class="info-bar">
+        <div>状态: <span id="statusText">未连接</span></div>
+        <div>编码: <span id="codecText">-</span></div>
+        <div>帧数: <span id="frameText">0</span></div>
+        <div>流量: <span id="bytesText">0 KB</span></div>
+      </div>
+
+      <div class="log-panel" id="logPanel"></div>
+    </div>
+  </div>
+
+  <script>
+    let ws = null;
+    let mediaSource = null;
+    let sourceBuffer = null;
+    let selectedCamera = null;
+    let frameCount = 0;
+    let totalBytes = 0;
+
+    // 日志
+    function log(msg, type = 'info') {
+      const panel = document.getElementById('logPanel');
+      const time = new Date().toLocaleTimeString();
+      const colors = { info: 'log-info', error: 'log-error', success: 'log-success' };
+      panel.innerHTML += `<div class="log-entry"><span class="log-time">[${time}]</span> <span class="${colors[type] || 'log-info'}">${msg}</span></div>`;
+      panel.scrollTop = panel.scrollHeight;
+    }
+
+    // 选择摄像头
+    document.querySelectorAll('.camera-item').forEach(item => {
+      item.addEventListener('click', () => {
+        document.querySelectorAll('.camera-item').forEach(i => i.classList.remove('active'));
+        item.classList.add('active');
+        selectedCamera = item.dataset.code;
+        document.getElementById('btnPlay').disabled = false;
+        log(`选择摄像头: ${selectedCamera}`);
+      });
+    });
+
+    // 播放自定义 cameraCode
+    function playCustom() {
+      const code = document.getElementById('customCode').value.trim();
+      if (!code) return;
+      selectedCamera = code;
+      document.getElementById('btnPlay').disabled = false;
+      log(`手动输入摄像头: ${code}`);
+      play();
+    }
+
+    // 播放
+    function play() {
+      if (!selectedCamera) {
+        alert('请先选择摄像头');
+        return;
+      }
+
+      const serverUrl = document.getElementById('serverUrl').value.trim();
+      const wsUrl = `${serverUrl}/live/${selectedCamera}`;
+
+      stop();
+      log(`连接: ${wsUrl}`);
+
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        setStatus('已连接', 'success');
+        log('WebSocket 连接成功', 'success');
+        document.getElementById('btnPlay').disabled = true;
+        document.getElementById('btnStop').disabled = false;
+      };
+
+      ws.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          handleMessage(JSON.parse(e.data));
+        } else {
+          handleBinary(e.data);
+        }
+      };
+
+      ws.onerror = () => {
+        setStatus('错误', 'error');
+        log('WebSocket 错误', 'error');
+      };
+
+      ws.onclose = () => {
+        setStatus('已断开');
+        log('WebSocket 断开');
+        cleanup();
+      };
+    }
+
+    // 处理控制消息
+    function handleMessage(msg) {
+      switch (msg.type) {
+        case 'status':
+          log(`状态: ${msg.status}`);
+          break;
+        case 'sdp':
+          log(`视频编码: ${msg.info.videoCodec}`, 'success');
+          document.getElementById('codecText').textContent = msg.info.videoCodec || '-';
+          initMSE();
+          break;
+        case 'error':
+          log(`错误: ${msg.message}`, 'error');
+          setStatus('错误', 'error');
+          break;
+      }
+    }
+
+    // 处理视频数据
+    function handleBinary(data) {
+      frameCount++;
+      totalBytes += data.byteLength;
+      document.getElementById('frameText').textContent = frameCount;
+      document.getElementById('bytesText').textContent = (totalBytes / 1024).toFixed(1) + ' KB';
+
+      if (sourceBuffer && !sourceBuffer.updating) {
+        try {
+          sourceBuffer.appendBuffer(new Uint8Array(data));
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
+
+    // 初始化 MSE
+    function initMSE() {
+      if (!window.MediaSource) {
+        log('浏览器不支持 MediaSource', 'error');
+        return;
+      }
+
+      mediaSource = new MediaSource();
+      const video = document.getElementById('videoPlayer');
+      video.src = URL.createObjectURL(mediaSource);
+
+      mediaSource.addEventListener('sourceopen', () => {
+        log('MediaSource 就绪');
+        const mimeType = 'video/mp4; codecs="avc1.42E01E"';
+        if (MediaSource.isTypeSupported(mimeType)) {
+          sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+          sourceBuffer.mode = 'sequence';
+          showVideo();
+        }
+      });
+    }
+
+    function showVideo() {
+      document.getElementById('placeholder').style.display = 'none';
+      document.getElementById('videoPlayer').style.display = 'block';
+    }
+
+    // 停止
+    function stop() {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+      cleanup();
+    }
+
+    function cleanup() {
+      if (mediaSource) {
+        try { mediaSource.endOfStream(); } catch(e) {}
+        mediaSource = null;
+      }
+      sourceBuffer = null;
+      const video = document.getElementById('videoPlayer');
+      if (video.src) {
+        URL.revokeObjectURL(video.src);
+        video.src = '';
+      }
+      document.getElementById('placeholder').style.display = 'block';
+      video.style.display = 'none';
+      document.getElementById('btnPlay').disabled = !selectedCamera;
+      document.getElementById('btnStop').disabled = true;
+      frameCount = 0;
+      totalBytes = 0;
+      document.getElementById('frameText').textContent = '0';
+      document.getElementById('bytesText').textContent = '0 KB';
+      document.getElementById('codecText').textContent = '-';
+    }
+
+    function setStatus(text, type) {
+      const el = document.getElementById('statusText');
+      el.textContent = text;
+      el.style.color = type === 'error' ? '#ff4757' : type === 'success' ? '#2ed573' : '#00d4ff';
+    }
+  </script>
+</body>
+</html>

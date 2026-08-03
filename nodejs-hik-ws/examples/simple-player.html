@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>简单播放器示例</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }
+    input { width: 100%; padding: 10px; margin: 5px 0; }
+    button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+    #status { padding: 10px; background: #f0f0f0; margin: 10px 0; }
+    #log { background: #1a1a2e; color: #0f0; padding: 10px; font-family: monospace; height: 200px; overflow-y: auto; }
+    video { width: 100%; max-width: 640px; margin-top: 10px; background: #000; }
+  </style>
+</head>
+<body>
+  <h2>海康威视 WebSocket 播放器 (简化版)</h2>
+  
+  <label>转发服务器:</label>
+  <input type="text" id="relayUrl" value="ws://localhost:8080" placeholder="ws://localhost:8080">
+  
+  <label>摄像头 URL:</label>
+  <input type="text" id="cameraUrl" placeholder="wss://proxy.example.com/proxy/.../openUrl/...">
+  
+  <div>
+    <button onclick="connect()">连接</button>
+    <button onclick="disconnect()">断开</button>
+  </div>
+  
+  <div id="status">状态: 未连接</div>
+  <div id="log"></div>
+  
+  <video id="video" autoplay playsinline muted></video>
+
+  <script>
+    let ws = null;
+    let mediaSource = null;
+    let sourceBuffer = null;
+    let bufferQueue = [];
+    let frameCount = 0;
+
+    function log(msg) {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString();
+      el.innerHTML += `[${time}] ${msg}\n`;
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(status) {
+      document.getElementById('status').textContent = `状态: ${status}`;
+    }
+
+    function connect() {
+      const relayUrl = document.getElementById('relayUrl').value;
+      const cameraUrl = document.getElementById('cameraUrl').value;
+      
+      if (!cameraUrl) {
+        alert('请输入摄像头 URL');
+        return;
+      }
+
+      const wsUrl = `${relayUrl}?url=${encodeURIComponent(cameraUrl)}`;
+      log(`连接: ${wsUrl}`);
+      
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        setStatus('已连接');
+        log('WebSocket 连接成功');
+      };
+
+      ws.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          // 控制消息
+          const msg = JSON.parse(e.data);
+          log(`控制消息: ${msg.type}`);
+          
+          if (msg.type === 'sdp') {
+            log(`视频编码: ${msg.info.videoCodec}`);
+            initMSE();
+          } else if (msg.type === 'error') {
+            log(`错误: ${msg.message}`);
+          }
+        } else {
+          // 视频数据
+          frameCount++;
+          if (frameCount % 30 === 0) {
+            log(`收到 ${frameCount} 帧, 数据大小: ${e.data.byteLength} bytes`);
+          }
+          
+          // 尝试将数据送入 MSE
+          const data = new Uint8Array(e.data);
+          if (sourceBuffer && !sourceBuffer.updating) {
+            try {
+              sourceBuffer.appendBuffer(data);
+            } catch (err) {
+              log(`Buffer 错误: ${err.message}`);
+            }
+          } else {
+            bufferQueue.push(data);
+          }
+        }
+      };
+
+      ws.onerror = (e) => {
+        setStatus('错误');
+        log('WebSocket 错误');
+      };
+
+      ws.onclose = () => {
+        setStatus('已断开');
+        log('WebSocket 关闭');
+        cleanup();
+      };
+    }
+
+    function initMSE() {
+      if (!window.MediaSource) {
+        log('浏览器不支持 MediaSource');
+        return;
+      }
+
+      mediaSource = new MediaSource();
+      document.getElementById('video').src = URL.createObjectURL(mediaSource);
+
+      mediaSource.addEventListener('sourceopen', () => {
+        log('MediaSource 打开');
+        
+        // 尝试 H.264
+        const mimeType = 'video/mp4; codecs="avc1.42E01E"';
+        if (MediaSource.isTypeSupported(mimeType)) {
+          sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+          sourceBuffer.mode = 'sequence';
+          
+          sourceBuffer.addEventListener('updateend', () => {
+            if (bufferQueue.length > 0 && !sourceBuffer.updating) {
+              sourceBuffer.appendBuffer(bufferQueue.shift());
+            }
+          });
+          
+          log('SourceBuffer 创建成功');
+        } else {
+          log('不支持 H.264');
+        }
+      });
+    }
+
+    function disconnect() {
+      if (ws) {
+        ws.close();
+      }
+      cleanup();
+    }
+
+    function cleanup() {
+      if (mediaSource) {
+        try {
+          mediaSource.endOfStream();
+        } catch(e) {}
+        mediaSource = null;
+      }
+      sourceBuffer = null;
+      bufferQueue = [];
+      frameCount = 0;
+    }
+  </script>
+</body>
+</html>
