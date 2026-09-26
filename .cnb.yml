@@ -38,6 +38,8 @@ main:
         - php-client/composer.json
         - go-client/go.mod
         - go-client/go.sum
+        - nodejs-client/package.json
+        - nodejs-client/package-lock.json
       stages:
         - name: build and push dev image
           script: bash .cnb/build-push-cnb-dev.sh latest

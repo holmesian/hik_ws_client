@@ -54,6 +54,11 @@ npm start                                                                       
 cd php-client && php8.4 demo.php "wss://example.com:6014/proxy/[1111::2222]:559/openUrl/auth_token"
 ```
 
+四套实现都可以在 CNB 云原生开发镜像里直接跑（`.cnb/Dockerfile`）：Go 1.22、Python 3（含
+`requirements.txt`）、Node.js 20 LTS、PHP 8.4（含 `composer.json`）、`git-lfs`、`ffmpeg` 均已装好，
+`go mod download` / `npm ci` 的依赖缓存也已预热。改这四个清单文件会触发镜像重建，见 `.cnb.yml`
+的 `ifModify`。
+
 > 取流链接（openUrl token）**一次性、分钟级过期**，取到后必须立刻使用，且不要为同一个链接
 > 跑两次程序。
 
