@@ -111,7 +111,6 @@ hik_ws_client/
 | [docs/ptz-stream-observability.md](./docs/ptz-stream-observability.md) | 云台转动时码流里能不能看出来：4 台设备 64 次转动的受控差分实测 |
 | [go-client/e2e/bench/README.md](./go-client/e2e/bench/README.md) | 多路并发压测与内存复用优化实测：并发梯度、单路资源基线、上限判据 |
 | [samples/README.md](./samples/README.md) | 真机采集样本与全量摸底实测结论（证据都在这里） |
-| [docs/verification/](./docs/verification/README.md) | 各次改动提交前实跑的证据截图（测试 / 样本回放 / ffprobe / 端到端） |
 | [.codebuddy/skills/hik-stream-debug/](./.codebuddy/skills/hik-stream-debug/SKILL.md) | 测试与调试方法：给一条链接或一份 OA curl 就能跑 |
 | [.codebuddy/adr/INDEX.md](./.codebuddy/adr/INDEX.md) | 架构决策记录 |
 | [.codebuddy/rules/](./.codebuddy/rules/) | 开发规范（解析硬约束、验证要求、脱敏红线） |
