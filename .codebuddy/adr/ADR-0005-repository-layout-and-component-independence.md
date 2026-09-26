@@ -65,4 +65,11 @@ related_docs: README.md, go-client/README.md, python-client/README.md
 ## 备注（Notes）
 
 - 关联规则：`.codebuddy/rules/project.md`（目录职责、文档结构）
-- 关联决策：`ADR-0001`（两侧等价对齐——本决策是它在目录形态上的落实）
+- 关联决策：`ADR-0001`（多实现等价对齐——本决策是它在目录形态上的落实）
+
+## 修订记录（Amendments）
+
+- **2026-09-26**：决策正文里的"两个并列的库"应读作"**每个语言实现各占一个顶层目录、并列**"。
+  原文以 Go / Python 两库为例陈述，其后 `nodejs-client/`、`php-client/` 均按本决策第 2 条
+  （"新增语言实现按同样形态开顶层目录"）落地：各自持有源码、依赖清单、测试入口与 `README.md`，
+  语言相关的 API 文档进各自库的 README。决策正文与日期不改，仅此追加。

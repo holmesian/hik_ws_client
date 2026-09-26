@@ -9,14 +9,16 @@
 
 | 编号 | 标题 | 状态 | 关联规则 |
 |------|------|------|----------|
-| [ADR-0001](./ADR-0001-transport-media-split-and-dual-implementation.md) | 传输层与媒体解析层分离，Go 为权威实现、Python 等价对齐 | ✅ Accepted | `project.md`, `testing.md` |
+| [ADR-0001](./ADR-0001-transport-media-split-and-dual-implementation.md) | 传输层与媒体解析层分离，Go 为权威实现、其余语言实现等价对齐 | ✅ Accepted | `project.md`, `testing.md` |
 | [ADR-0002](./ADR-0002-stream-is-the-source-of-truth.md) | 线格式以码流为准，SDP 仅作提示；一次性判定必须跨消息互证 | ✅ Accepted | `media-parsing.md` |
 | [ADR-0003](./ADR-0003-real-device-samples-as-regression-baseline.md) | 真机样本库（Git LFS）+ 严格结构走查作为验收基线 | ✅ Accepted | `testing.md` |
 | [ADR-0004](./ADR-0004-component-scope-boundary.md) | 组件边界：只做取流与解复用，不解码/解密/私有流/PTZ | ✅ Accepted | `project.md`, `media-parsing.md` |
-| [ADR-0005](./ADR-0005-repository-layout-and-component-independence.md) | 仓库布局：Go 与 Python 并列为两个独立库；不承载调用方项目上下文 | ✅ Accepted | `project.md` |
+| [ADR-0005](./ADR-0005-repository-layout-and-component-independence.md) | 仓库布局：各语言实现并列为独立库；不承载调用方项目上下文 | ✅ Accepted | `project.md` |
 
 > ADR-0001 ~ 0004 记录的都是**已落地并经真机验证的既成行为**——把 123 台设备摸底换来的结论
 > 固化成约束，2026-08-01 经项目 owner 确认转为 `Accepted`，没有随之改动任何代码。
+> ADR-0001 与 ADR-0005 于 2026-09-26 追加"修订记录"，把"多实现等价对齐 / 各语言各占一个顶层
+> 目录"的原则扩展到其后新增的 `nodejs-client`、`php-client`（决策正文与日期不改）。
 
 ## 组件定位
 

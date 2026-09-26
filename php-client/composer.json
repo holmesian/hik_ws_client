@@ -1,0 +1,19 @@
+{
+    "name": "holmesian/hik-ws-client-php",
+    "description": "Hikvision private WebSocket protocol stream client (PHP) — transport + MPEG-PS demux to Annex-B access units",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.4",
+        "ext-openssl": "*",
+        "ext-gmp": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "HikWs\\": "src/"
+        }
+    },
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}

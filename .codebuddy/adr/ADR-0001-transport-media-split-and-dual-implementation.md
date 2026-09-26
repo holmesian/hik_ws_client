@@ -49,4 +49,12 @@ related_docs: go-client/, python-client/hik_media.py, docs/media-pipeline.md
 ## 备注（Notes）
 
 - 关联规则：`.codebuddy/rules/project.md`、`.codebuddy/rules/testing.md`
-- 目录布局：`ADR-0005`（Go 与 Python 并列为两个独立库，`samples/` / `docs/` 两侧共享）
+- 目录布局：`ADR-0005`（各语言实现并列为独立库，`samples/` / `docs/` 各侧共享）
+
+## 修订记录（Amendments）
+
+- **2026-09-26**：本决策的"多实现等价对齐"原则**同样适用于后续新增的语言实现**，不限于原文的
+  Go / Python 两侧。新增实现须满足同一约束：传输与解析分层、回放 `samples/` 并断言与 Go **同一组**
+  帧数 / 关键帧数 / 分辨率。已按此落地的实现：`nodejs-client/`（部分对齐：协议/加密/RTP/PS/媒体管线，
+  未含码流内 SPS 分辨率还原与样本回放）、`php-client/`（完整对齐：回放 `samples/` 四份真机采集，
+  断言同一组数字，见 `php-client/tests/HikMediaTest.php`）。决策正文与日期不改，仅此追加。
