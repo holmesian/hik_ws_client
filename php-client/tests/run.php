@@ -13,9 +13,12 @@ require __DIR__ . '/../src/index.php';
 require __DIR__ . '/MiniTest.php';
 require __DIR__ . '/TestHelper.php';
 require __DIR__ . '/HikMediaTest.php';
+require __DIR__ . '/TlsRegressionTest.php';
 
 use HikWs\Tests\HikMediaTest;
+use HikWs\Tests\TlsRegressionTest;
 use HikWs\Tests\MiniTest;
 
 HikMediaTest::register();
+TlsRegressionTest::register();
 exit(MiniTest::summary());

@@ -76,12 +76,12 @@ final class WebSocket
         $this->buffer = '';
 
         if ($this->tls) {
-            // 让 TLS 握手在 connect 阶段完成，失败立即暴露。
+            // `ssl://` 包装器已在 stream_socket_client 阶段完成 TLS 握手，这里**不能**再调
+            // stream_socket_enable_crypto —— 同一个 stream 上重复握手会直接失败
+            // （`SSL/TLS already set-up for this stream`），调用方看到的是"TLS handshake failed"，
+            // 但拨号本身其实是成功的。与 python-client 的 asyncio.open_connection(ssl=...) 等价：
+            // TLS 只建立一次。
             stream_set_timeout($sock, (int) $this->connectTimeout);
-            if (@stream_socket_enable_crypto($sock, true, STREAM_CRYPTO_METHOD_TLS_CLIENT) === false) {
-                $this->close();
-                throw new \RuntimeException('TLS handshake failed');
-            }
         }
 
         $this->handshake();

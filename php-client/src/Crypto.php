@@ -13,8 +13,21 @@ namespace HikWs;
  */
 final class Crypto
 {
-    private const FIXED_KEY = '1234567891234567123456789123456712345678912345671234567891234567';
-    private const FIXED_IV  = '12345678912345671234567891234567';
+    // 海康 JS 播放器里硬编码的固定密钥。注意这两个字面量是**十六进制文本**，AES 用的是它们
+    // 解码后的字节（key 32 字节 = aes-256，IV 16 字节）——直接把 hex 串喂 openssl_encrypt 会得到
+    // 完全不同的密文（Go / Python 侧都是 `hex.DecodeString` / `bytes.fromhex` 后再解密）。
+    private const FIXED_KEY_HEX = '1234567891234567123456789123456712345678912345671234567891234567';
+    private const FIXED_IV_HEX  = '12345678912345671234567891234567';
+
+    private static function fixedKey(): string
+    {
+        return hex2bin(self::FIXED_KEY_HEX);
+    }
+
+    private static function fixedIv(): string
+    {
+        return hex2bin(self::FIXED_IV_HEX);
+    }
 
     public static function generateSecretKey(string $pkd, string $rand, string $username, string $password): string
     {
@@ -32,11 +45,11 @@ final class Crypto
     public static function generateClientIvKey(): array
     {
         $nowMs = (string) (int) floor(microtime(true) * 1000);
-        $iv = bin2hex(self::aesEncryptCbc($nowMs, self::FIXED_KEY, self::FIXED_IV));
+        $iv = bin2hex(self::aesEncryptCbc($nowMs, self::fixedKey(), self::fixedIv()));
         while (strlen($iv) < 64) {
             $iv .= $iv;
         }
-        $key = bin2hex(self::aesEncryptCbc($nowMs, self::FIXED_KEY, self::FIXED_IV));
+        $key = bin2hex(self::aesEncryptCbc($nowMs, self::fixedKey(), self::fixedIv()));
         while (strlen($key) < 64) {
             $key .= $key;
         }

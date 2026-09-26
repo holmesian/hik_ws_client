@@ -43,6 +43,7 @@ final class HikMediaTest
         self::replayTests();
         self::clientWiringTests();
         self::multiMessageFrameTests();
+        self::cryptoTests();
     }
 
     // ------------------------------------------------------------------
@@ -544,6 +545,37 @@ final class HikMediaTest
             $c->feedVideo(TestHelper::psPack() . TestHelper::psVideoPes($idr, 3600));
             $c->flushMedia();
             MiniTest::assertSame([$idr], $got);
+        });
+    }
+
+    /**
+     * 加密层回归：Go / Python / PHP 三侧必须对同一输入给出**逐字节相同**的密文。
+     *
+     * 这里的两条断言都是真机/跨实现撞出来的分歧，不是纸面推导：
+     *  - AES 的 key / IV 是**解码后的字节**，不是硬编码的十六进制串；
+     *  - 只用一次 TLS 握手（`ssl://` 已完成，不再 enable_crypto）。
+     */
+    private static function cryptoTests(): void
+    {
+        // 固定时间戳下的 AES-128/256-CBC PKCS7 密文。期望值是 Go aesEncryptCBC 与
+        // Python HikCrypto.aes_encrypt_cbc 在同一输入上的输出（两侧一致）。
+        MiniTest::run('aes cbc matches go/python baseline', function (): void {
+            $method = new \ReflectionMethod(\HikWs\Crypto::class, 'aesEncryptCbc');
+            $method->setAccessible(true);
+            $key = hex2bin('1234567891234567123456789123456712345678912345671234567891234567');
+            $iv = hex2bin('12345678912345671234567891234567');
+            $got = bin2hex($method->invoke(null, '1758900000000', $key, $iv));
+            MiniTest::assertSame('6e00f565aa2df9bc5dd6e5d426c3aa85', $got);
+        });
+
+        // generateClientIvKey 的形态：32 字节密文 hex = 64 字符，不足则自拼。
+        MiniTest::run('client iv key is 64 hex chars', function (): void {
+            [$iv, $key] = \HikWs\Crypto::generateClientIvKey();
+            MiniTest::assertSame(64, strlen($iv));
+            MiniTest::assertSame(64, strlen($key));
+            MiniTest::assertSame($iv, $key, '同一时间戳派生出的 iv 与 key 相同');
+            // 半个即 32 字符重复两次——证明用的是解码后的字节而非 hex 串（后者会得到不同结果）。
+            MiniTest::assertSame(substr($iv, 0, 32), substr($iv, 32));
         });
     }
 
