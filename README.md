@@ -5,16 +5,18 @@
 
 这是一个**独立组件**，不承载任何调用方项目的业务上下文（[ADR-0005](./.codebuddy/adr/ADR-0005-repository-layout-and-component-independence.md)）。
 
-## 三个并列的实现
+## 四个并列的实现
 
 | 库 | 定位 | 入口 |
 | --- | --- | --- |
 | [`go-client/`](./go-client/README.md) | Go 实现，生产取流用这套，也是行为基准 | `import hikws "github.com/holmesian/hik_ws_client/go-client"` |
 | [`python-client/`](./python-client/README.md) | Python 实现，分析与研究工具 | `from hik_ws_client import HikMediaClient` |
 | [`nodejs-client/`](./nodejs-client/README.md) | Node.js 实现，WebSocket 转发服务器与客户端 | `import { HikMediaClient, HikRelayServer } from 'nodejs-client'` |
+| [`php-client/`](./php-client/README.md) | PHP 实现（要求 PHP 8.4+），媒体解析层仅标准库 | `require 'php-client/src/index.php'` |
 
-三套实现共用同一套解析逻辑、回放同一份样本、断言同一组数字（[ADR-0001](./.codebuddy/adr/ADR-0001-transport-media-split-and-dual-implementation.md)）。
-三库之外的目录都是**三侧共享**的资产：`samples/`（真机样本与实测结论）、`docs/`（与语言无关的
+四套实现共用同一套解析逻辑、回放同一份样本、断言同一组数字（[ADR-0001](./.codebuddy/adr/ADR-0001-transport-media-split-and-dual-implementation.md)、
+[ADR-0005](./.codebuddy/adr/ADR-0005-repository-layout-and-component-independence.md)）。
+各库之外的目录都是**各侧共享**的资产：`samples/`（真机样本与实测结论）、`docs/`（与语言无关的
 协议与管线文档）、`.codebuddy/`（规范、架构决策、调试 skill）。
 
 ## 快速开始
@@ -46,6 +48,12 @@ node demo.js "wss://example.com:6014/proxy/[1111::2222]:559/openUrl/auth_token" 
 npm start                                                                           # 转发服务器（默认 8080）
 ```
 
+**PHP**（要求 PHP 8.4+，需 `ext-openssl` / `ext-gmp`）：
+
+```bash
+cd php-client && php8.4 demo.php "wss://example.com:6014/proxy/[1111::2222]:559/openUrl/auth_token"
+```
+
 > 取流链接（openUrl token）**一次性、分钟级过期**，取到后必须立刻使用，且不要为同一个链接
 > 跑两次程序。
 
@@ -57,13 +65,17 @@ npm start                                                                       
 (cd go-client && go build ./... && go vet ./... && go test -count=1 -race ./...)
 (cd python-client && python3 -m unittest test_hik_media)
 (cd nodejs-client && npm install && npm test)
+(cd php-client && php8.4 tests/run.php)
 ```
 
-三套测试都会回放 `samples/` 里的真机采集并断言**同一组**帧数、关键帧数和分辨率——任一侧改坏了
-解析，回放数字就对不上。样本走 Git LFS，没 `git lfs pull` 时用例会 skip（skip 等于没跑回归）。
-Node.js 这边带的是协议/加密/SDP/注册表单测，以及本次对齐 go-client 新增的鉴权（`buildRealplayRequest`
+Go / Python / PHP 三套测试都会回放 `samples/` 里的真机采集并断言**同一组**帧数、关键帧数和分辨率——
+任一侧改坏了解析，回放数字就对不上。样本走 Git LFS，没 `git lfs pull` 时用例会 skip（skip 等于没跑
+回归）。
+Node.js 这边带的是协议/加密/SDP/注册表单测，以及对齐 go-client 新增的鉴权（`buildRealplayRequest`
 空 key 默认 / `useRealplayAuth` 接线）、PS 解复用、RTP 判定与剥离、媒体管线（sniffCodec / analyzeFrame /
 clone）、`ServerError` 终态、看门狗、keepalive、异步投递队列等单测（`node --test`）。真机回放需真实设备。
+PHP 这边带协议封包 / RTP / PS 解复用 / SPS / SDP / 客户端接线单测 + 四份真机样本回放（`php8.4 tests/run.php`，
+不引 PHPUnit）。
 
 **注意**：帧数、fps、分辨率全对**不代表码流是对的**——已修复的每个解析缺陷都能让这些数字看起来
 完全正常。正确性判据见 `.codebuddy/rules/testing.md`。
@@ -75,8 +87,9 @@ hik_ws_client/
 ├── go-client/           # Go 库（生产路径），含 e2e/probe 单路探针与 e2e/bench 并发压测
 ├── python-client/       # Python 库（分析工具），含 demo.py / play.py
 ├── nodejs-client/       # Node.js 库，WebSocket 转发服务器与客户端，含单测
-├── samples/             # 三侧共享：真机 MPEG-PS 采集（Git LFS）与实测结论
-├── docs/                # 三侧共享：与语言无关的技术文档
+├── php-client/          # PHP 库（PHP 8.4+），含 demo.php 与测试
+├── samples/             # 各侧共享：真机 MPEG-PS 采集（Git LFS）与实测结论
+├── docs/                # 各侧共享：与语言无关的技术文档
 └── .codebuddy/          # 规范、架构决策、调试 skill
 ```
 
@@ -87,6 +100,7 @@ hik_ws_client/
 | [go-client/README.md](./go-client/README.md) | Go 库 API、健壮性与并发选项 |
 | [python-client/README.md](./python-client/README.md) | Python 库用法与回调 |
 | [nodejs-client/README.md](./nodejs-client/README.md) | Node.js 库 API、转发服务器与单测 |
+| [php-client/README.md](./php-client/README.md) | PHP 库 API、回调与测试 |
 | [docs/protocol.md](./docs/protocol.md) | 传输层协议：连接模型、握手、鉴权与密钥派生、封包格式、错误码 |
 | [docs/media-pipeline.md](./docs/media-pipeline.md) | 媒体管线：RTP 判定与剥离 → PS 解复用 → 访问单元 → 元信息恢复 |
 | [docs/ptz-stream-observability.md](./docs/ptz-stream-observability.md) | 云台转动时码流里能不能看出来：4 台设备 64 次转动的受控差分实测 |

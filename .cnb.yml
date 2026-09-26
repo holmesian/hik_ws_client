@@ -35,6 +35,7 @@ main:
       ifModify:
         - .cnb/**
         - python-client/requirements.txt
+        - php-client/composer.json
         - go-client/go.mod
         - go-client/go.sum
       stages:

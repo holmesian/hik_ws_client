@@ -38,6 +38,17 @@ RUN set -ex && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/*
 
 
+# 安装 PHP 8.4（bookworm 自带 8.2，php-client 要求 8.4+，走 Sury 源）
+RUN set -ex && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends lsb-release ca-certificates apt-transport-https gnupg && \
+    curl -fsSL https://packages.sury.org/php/apt.gpg -o /usr/share/keyrings/sury-php.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ bookworm main" \
+        > /etc/apt/sources.list.d/sury-php.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends php8.4-cli php8.4-mbstring php8.4-curl php8.4-xml php8.4-gmp && \
+    rm -rf /var/lib/apt/lists/*
+
 # 安装项目 Python 依赖（bookworm 的 pip 需要 --break-system-packages 装入系统环境）
 COPY python-client/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt \
