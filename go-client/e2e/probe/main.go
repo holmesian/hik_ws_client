@@ -12,6 +12,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -33,6 +35,12 @@ func main() {
 	reconnects := flag.Int("reconnects", 2, "max reconnect attempts")
 	stall := flag.Duration("stall", 10*time.Second, "abort a session after this long without data (0 disables)")
 	async := flag.Int("async", 64, "async delivery queue depth (0 = deliver on the read loop)")
+	// TLS knobs expose the HikConfig.TLSConfig entry point (issue #33).
+	// Default behavior verifies the wss server certificate. -cacert points
+	// at a PEM CA bundle for the Hikvision proxy; -skipverify is for
+	// self-signed test proxies only and must not be used in production.
+	cacert := flag.String("cacert", "", "PEM CA bundle to verify the wss server cert against")
+	skipverify := flag.Bool("skipverify", false, "INSECURE: skip wss cert verification (self-signed test proxies only)")
 	flag.Parse()
 
 	if *url == "" {
@@ -47,6 +55,24 @@ func main() {
 	config.ReconnectWait = 2 * time.Second
 	config.StallTimeout = *stall
 	config.AsyncDelivery = *async
+
+	if *cacert != "" {
+		pem, err := os.ReadFile(*cacert)
+		if err != nil {
+			log.Fatalf("read cacert: %v", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			log.Fatalf("no certificates parsed from %s", *cacert)
+		}
+		config.TLSConfig = &tls.Config{RootCAs: pool}
+	}
+	if *skipverify {
+		if config.TLSConfig == nil {
+			config.TLSConfig = &tls.Config{}
+		}
+		config.TLSConfig.InsecureSkipVerify = true
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *dur)
 	defer cancel()

@@ -90,8 +90,20 @@ func (c *HikMediaClient) buildMediaURL() string {
 }
 
 func (c *HikMediaClient) Connect(ctx context.Context) error {
+	tlsConfig := c.Config.TLSConfig
+	if tlsConfig == nil {
+		// Secure by default: verify the server certificate. The previously
+		// hardcoded InsecureSkipVerify:true (issue #33) is gone — callers
+		// who need a private CA or a self-signed test proxy set
+		// HikConfig.TLSConfig instead.
+		tlsConfig = &tls.Config{}
+	} else {
+		// Clone so a caller-supplied config is never mutated by the dial
+		// and concurrent clients don't share mutable TLS state.
+		tlsConfig = tlsConfig.Clone()
+	}
 	dialer := websocket.Dialer{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig: tlsConfig,
 		// Without this the handshake can hang forever on a black-holed
 		// network, which would also hang the reconnect loop.
 		HandshakeTimeout: dialTimeout,
