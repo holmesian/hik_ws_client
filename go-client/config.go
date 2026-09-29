@@ -1,6 +1,7 @@
 package hikws
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net/url"
@@ -44,6 +45,19 @@ type HikConfig struct {
 	// longer throttles the socket. Sends block when the buffer is full, so
 	// no media is ever silently dropped.
 	AsyncDelivery int
+
+	// TLSConfig is the optional *tls.Config used for the wss handshake.
+	// When nil, Connect verifies the server certificate with a secure
+	// default (InsecureSkipVerify=false) — the previous hardcoded
+	// InsecureSkipVerify:true was removed (issue #33). Set TLSConfig to:
+	//   - supply a private CA (RootCAs) so wss to the Hikvision proxy does
+	//     normal certificate validation;
+	//   - attach client certificates;
+	//   - or, only for test/self-signed setups, opt out of verification by
+	//     setting InsecureSkipVerify:true.
+	// The config is cloned before each dial, so a shared instance is never
+	// mutated by the client.
+	TLSConfig *tls.Config
 }
 
 // ParseProxyURL parses a Hikvision proxy URL to extract the configuration.

@@ -3,6 +3,8 @@ package hikws
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"log"
@@ -53,7 +55,7 @@ func startMock(t *testing.T, handle func(*testing.T, *websocket.Conn)) *HikConfi
 		t.Fatal(err)
 	}
 	port, _ := strconv.Atoi(u.Port())
-	return &HikConfig{
+	cfg := &HikConfig{
 		ProxyHost:  u.Hostname(),
 		ProxyPort:  port,
 		DeviceIP:   "127.0.0.1",
@@ -62,6 +64,14 @@ func startMock(t *testing.T, handle func(*testing.T, *websocket.Conn)) *HikConfi
 		Password:   "token123",
 		Version:    "0.1",
 	}
+	// The mock TLS server presents a self-signed cert. Verify it via its own
+	// CA to exercise the new TLSConfig entry point (issue #33) and prove the
+	// secure-by-default dial works once the chain is trusted. Callers reach
+	// for InsecureSkipVerify:true here only for self-signed test setups.
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	cfg.TLSConfig = &tls.Config{RootCAs: pool}
+	return cfg
 }
 
 // sendAuth/expectRealplay reproduce the server side of the handshake:

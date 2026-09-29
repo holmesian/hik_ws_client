@@ -58,6 +58,34 @@ func main() {
 `Stream` 接管整条会话生命周期。若要自己掌控握手，仍可按
 `Connect` → `Authenticate` → `Realplay` → `Run` 逐步调用，此时重连由调用方负责。
 
+## TLS 配置（证书校验）
+
+`Connect` 默认**校验 wss 服务端证书**（`InsecureSkipVerify=false`），不再写死跳过校验
+（issue #33）。证书入口通过 `HikConfig.TLSConfig`（`*tls.Config`）暴露：
+
+```go
+// 1) 默认：校验证书（生产路径，无需任何配置）
+client := hikws.NewHikMediaClient(config)
+
+// 2) 海康代理用私有 CA 签发：传入 CA 池做正常校验
+pool := x509.NewCertPool()
+pool.AppendCertsFromPEM(caPEM)
+config.TLSConfig = &tls.Config{RootCAs: pool}
+
+// 3) 自签名测试代理（仅测试环境）：显式关闭校验
+config.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+```
+
+`TLSConfig` 为 nil 时内部使用安全默认；非 nil 时每次拨号前会 `Clone`，调用方的配置不会被改动。
+下游（如 DataStation EAS-4730）由此移除「wss 关校验」的受控偏离，恢复证书校验。
+
+实链路探针暴露了同一入口：`-cacert <pem>` 指定 CA 包，`-skipverify` 仅用于自签名测试代理：
+
+```bash
+go run ./e2e/probe -url '...' -dur 20s -cacert /path/to/ca.pem
+go run ./e2e/probe -url '...' -dur 20s -skipverify   # 仅自签名测试代理
+```
+
 ## 回调
 
 | 回调 | 参数 | 说明 |
