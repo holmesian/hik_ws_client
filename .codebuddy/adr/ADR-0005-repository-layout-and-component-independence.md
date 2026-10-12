@@ -73,3 +73,6 @@ related_docs: README.md, go-client/README.md, python-client/README.md
   原文以 Go / Python 两库为例陈述，其后 `nodejs-client/`、`php-client/` 均按本决策第 2 条
   （"新增语言实现按同样形态开顶层目录"）落地：各自持有源码、依赖清单、测试入口与 `README.md`，
   语言相关的 API 文档进各自库的 README。决策正文与日期不改，仅此追加。
+- **2026-10-12**：`rust-client/` 按同一形态落地（2026-10-12 经 owner 确认）：持有 `Cargo.toml` /
+  `Cargo.lock`、`src/`、`tests/`、`src/bin/demo.rs` 与 `README.md`；开发镜像与 `.cnb.yml` 的
+  `ifModify` 同步纳入 Rust 工具链与依赖清单。决策正文与日期不改，仅此追加。

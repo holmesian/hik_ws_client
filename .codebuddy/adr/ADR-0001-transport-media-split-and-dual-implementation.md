@@ -58,3 +58,8 @@ related_docs: go-client/, python-client/hik_media.py, docs/media-pipeline.md
   帧数 / 关键帧数 / 分辨率。已按此落地的实现：`nodejs-client/`（部分对齐：协议/加密/RTP/PS/媒体管线，
   未含码流内 SPS 分辨率还原与样本回放）、`php-client/`（完整对齐：回放 `samples/` 四份真机采集，
   断言同一组数字，见 `php-client/tests/HikMediaTest.php`）。决策正文与日期不改，仅此追加。
+- **2026-10-12**：`rust-client/` 按同一约束落地（完整对齐，2026-10-12 经 owner 确认）：回放
+  `samples/` 四份真机采集断言同一组数字，并追加**交付字节 sha256 与 Go 基准逐位相同**的比对
+  （`rust-client/tests/sample_replay_test.rs`）；同步移植 Go 侧集成/韧性用例（mock 代理 + TCP
+  回环）。媒体解析层零第三方 crate；`AsyncDelivery` 类工程设施未移植（单侧自由项，不改变交付
+  字节）。决策正文与日期不改，仅此追加。

@@ -1,0 +1,36 @@
+[package]
+name = "hik-ws-client"
+version = "0.1.0"
+edition = "2021"
+description = "海康威视 Web 私有 WebSocket 协议的取流客户端库（Rust 实现），与 go-client 行为基准对齐"
+repository = "https://cnb.cool/holmesian/hik_ws_client"
+
+# 传输层（WebSocket / TLS / 鉴权 / 封包 / 重连）与媒体解析层（RTP / PS / SPS / SDP）
+# 分离：媒体层不依赖网络、可对字节直接单测（ADR-0001）。
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+webpki-roots = "0.26"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+aes = "0.8"
+cbc = "0.1"
+num-bigint = "0.4"
+rand = "0.8"
+serde_json = "1"
+log = "0.4"
+
+[lib]
+name = "hik_ws_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+
+[profile.release]
+debug = false
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"
