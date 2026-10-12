@@ -4,6 +4,8 @@ alwaysApply: false
 globs:
   - "**/*_test.go"
   - "python-client/test_hik_media.py"
+  - "rust-client/tests/**"
+  - "rust-client/src/**/*.rs"
   - "go-client/e2e/**"
   - "samples/**"
 ---
@@ -32,8 +34,9 @@ globs:
 `samples/`（Git LFS）里的四份真机采集覆盖 `{H.264, H.265} × {720p, 1080p}`，即全量摸底中 94 台
 出流设备的全部形态。
 
-- Go：`go-client/sample_replay_test.go`；Python：`python-client/test_hik_media.py`。两边断言
-  **同一组**数值。
+- Go：`go-client/sample_replay_test.go`；Python：`python-client/test_hik_media.py`；
+  Rust：`rust-client/tests/sample_replay_test.rs`（另加交付字节 sha256 与 Go 基准的逐位比对）。
+  各侧断言**同一组**数值。
 - 跑之前 `git lfs install && git lfs pull`。未拉取时用例会 skip——**skip 等于没跑回归**，CI 必须
   显式拉取。
 - 改任何解析逻辑（包括性能优化）后必须重跑，数值对不上就是改坏了。
@@ -72,6 +75,9 @@ globs:
 
 # Python：媒体层仅标准库
 (cd python-client && python3 -m unittest test_hik_media -v)
+
+# Rust：clippy 零警告、fmt 干净
+(cd rust-client && cargo test && cargo clippy --all-targets && cargo fmt --check)
 ```
 
 新修复必须附带能复现该缺陷的回归用例；只改代码不加用例的修复视为未完成。

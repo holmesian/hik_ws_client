@@ -40,6 +40,8 @@ main:
         - go-client/go.sum
         - nodejs-client/package.json
         - nodejs-client/package-lock.json
+        - rust-client/Cargo.toml
+        - rust-client/Cargo.lock
       stages:
         - name: build and push dev image
           script: bash .cnb/build-push-cnb-dev.sh latest

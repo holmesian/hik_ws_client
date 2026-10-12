@@ -4,6 +4,7 @@ alwaysApply: false
 globs:
   - "go-client/**"
   - "python-client/**"
+  - "rust-client/src/**"
 ---
 
 ## 适用范围

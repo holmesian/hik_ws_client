@@ -1,5 +1,5 @@
-# 开发环境镜像：本项目四个并列实现（Go / Python / Node.js / PHP）的运行与测试环境
-# 见 README「四个并列的实现」与 .codebuddy/rules/project.md。
+# 开发环境镜像：本项目五个并列实现（Go / Python / Node.js / PHP / Rust）的运行与测试环境
+# 见 README「五个并列的实现」与 .codebuddy/rules/project.md。
 # 本文件只服务本仓自身需要的能力，不承载任何调用方项目的上下文（ADR-0005）。
 FROM golang:1.22-bookworm
 
@@ -9,6 +9,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GOPROXY=https://goproxy.cn,direct \
     PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple \
     NPM_CONFIG_REGISTRY=https://registry.npmmirror.com \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    # rustup / crates.io 走国内镜像（RsProxy），与 Go / PyPI / npm 同取向
+    RUSTUP_DIST_SERVER=https://rsproxy.cn \
+    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
     # 禁止 CodeBuddy CLI 在容器内拉起后台任务进程
     CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS=1
 
@@ -46,6 +52,21 @@ RUN set -eux; \
 # 真源是 nodejs-client/package-lock.json；改版本时记得同步 .cnb.yml 的 ifModify。
 COPY nodejs-client/package.json nodejs-client/package-lock.json /tmp/nodejs-client/
 RUN cd /tmp/nodejs-client && npm ci --no-audit --no-fund && rm -rf /tmp/nodejs-client
+
+# Rust stable 工具链（rust-client 用；rustls 的 ring provider 只需 build-essential 的 C 工具链）。
+# 装到 /usr/local 下并预置 crates.io 国内镜像源。
+RUN set -eux; \
+    curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh -o /tmp/rustup-init.sh; \
+    sh /tmp/rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain stable; \
+    rm -f /tmp/rustup-init.sh; \
+    rustc --version; cargo --version; \
+    mkdir -p "$CARGO_HOME"; \
+    printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n\n[registries.rsproxy]\nindex = "sparse+https://rsproxy.cn/index/"\n\n[net]\ngit-fetch-with-cli = true\n' > "$CARGO_HOME/config.toml"; \
+    cat "$CARGO_HOME/config.toml"
+
+# 预热 Rust 依赖（cargo fetch 走 Cargo.lock；改依赖时记得同步 .cnb.yml 的 ifModify）。
+COPY rust-client/Cargo.toml rust-client/Cargo.lock /tmp/rust-client/
+RUN cd /tmp/rust-client && cargo fetch && rm -rf /tmp/rust-client
 
 # 安装 VSCode Server
 RUN set -ex && \
