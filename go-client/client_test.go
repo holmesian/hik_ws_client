@@ -730,3 +730,65 @@ func TestIntegration_PS_H265(t *testing.T) {
 		t.Fatalf("errors = %v, want the single session error", errs)
 	}
 }
+
+// TestConnectUserAgentHeader locks the HikConfig.UserAgent dial passthrough
+// (EAS-7537): a configured UA reaches the server verbatim, and with the field
+// empty the handshake carries net/http's default ("Go-http-client/1.1") — the
+// leak the field exists to let callers override.
+func TestConnectUserAgentHeader(t *testing.T) {
+	const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	for _, tc := range []struct {
+		name      string
+		userAgent string
+		want      string
+	}{
+		{"configured UA is passed through", ua, ua},
+		{"unset falls back to Go default", "", "Go-http-client/1.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uaCh := make(chan string, 1)
+			up := websocket.Upgrader{Subprotocols: []string{"v1.0.0"}}
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				uaCh <- r.Header.Get("User-Agent")
+				conn, err := up.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				conn.Close()
+			}))
+			defer srv.Close()
+
+			u, err := url.Parse(srv.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			port, _ := strconv.Atoi(u.Port())
+			cfg := &HikConfig{
+				ProxyHost:  u.Hostname(),
+				ProxyPort:  port,
+				DeviceIP:   "127.0.0.1",
+				DevicePort: 559,
+				Version:    "0.1",
+				UserAgent:  tc.userAgent,
+			}
+			pool := x509.NewCertPool()
+			pool.AddCert(srv.Certificate())
+			cfg.TLSConfig = &tls.Config{RootCAs: pool}
+
+			c := NewHikMediaClient(cfg)
+			if err := c.Connect(context.Background()); err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			t.Cleanup(func() { c.Close() })
+
+			select {
+			case got := <-uaCh:
+				if got != tc.want {
+					t.Fatalf("server saw User-Agent %q, want %q", got, tc.want)
+				}
+			default:
+				t.Fatal("server never saw the dial request")
+			}
+		})
+	}
+}

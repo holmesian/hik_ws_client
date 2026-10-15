@@ -46,6 +46,14 @@ type HikConfig struct {
 	// no media is ever silently dropped.
 	AsyncDelivery int
 
+	// UserAgent overrides the User-Agent header sent on the wss dial.
+	// Empty keeps the Go default ("Go-http-client/1.1", injected by
+	// net/http when the handshake request carries none). Callers that
+	// need to present a browser UA (e.g. HolmesAIEye's hikws ingest,
+	// EAS-7537) set it explicitly; gorilla's Dialer writes the header
+	// verbatim into the handshake request.
+	UserAgent string
+
 	// TLSConfig is the optional *tls.Config used for the wss handshake.
 	// When nil, Connect verifies the server certificate with a secure
 	// default (InsecureSkipVerify=false) — the previous hardcoded

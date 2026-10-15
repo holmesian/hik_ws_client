@@ -112,6 +112,13 @@ func (c *HikMediaClient) Connect(ctx context.Context) error {
 	url := c.buildMediaURL()
 	header := http.Header{}
 	header.Add("Sec-WebSocket-Protocol", "v1.0.0")
+	// Pass the caller's UA through to the dial: without an explicit
+	// header, net/http fills in "Go-http-client/1.1" when the handshake
+	// request is written, which callers behind UA-filtering proxies
+	// cannot override (EAS-7537).
+	if c.Config.UserAgent != "" {
+		header.Set("User-Agent", c.Config.UserAgent)
+	}
 
 	conn, _, err := dialer.DialContext(ctx, url, header)
 	if err != nil {

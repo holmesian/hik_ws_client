@@ -39,6 +39,7 @@ func main() {
 	config.ReconnectWait = 2 * time.Second // 退避基数，第 N 次等待 N*base
 	config.StallTimeout = 10 * time.Second // 连接还在但不来数据 = 断流
 	config.AsyncDelivery = 64              // 解析/回调移出读循环，队列深度
+	config.UserAgent = "Mozilla/5.0 ..."    // 拨号 User-Agent；留空为 Go 默认 Go-http-client/1.1
 
 	client := hikws.NewHikMediaClient(config)
 	defer client.Close()
