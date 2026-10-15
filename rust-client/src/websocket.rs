@@ -30,6 +30,13 @@ use crate::error::Error;
 /// WebSocket 子协议（协议文档「握手」：固定 `v1.0.0`）。
 pub const SUBPROTOCOL: &str = "v1.0.0";
 
+/// 握手请求携带的 User-Agent：与 go-client 拨号 header、Control-go OA HTTP
+/// 客户端共用同一个值（EAS-7533）。本库手搓的握手原先完全不带 UA，比 Go 侧
+/// 默认暴露 `Go-http-client/1.1` 更糟；上游（OA 与媒体代理）实测均不校验 UA，
+/// 此处为主动伪装，三处实现必须同值，改动须同步（ADR-0001 多实现等价对齐）。
+pub const USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
+
 /// RFC 6455 的 Accept 魔数。
 const WS_ACCEPT_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -209,6 +216,7 @@ impl<S: WsIo> WebSocket<S> {
              Sec-WebSocket-Key: {sec_key}\r\n\
              Sec-WebSocket-Version: 13\r\n\
              Sec-WebSocket-Protocol: {SUBPROTOCOL}\r\n\
+             User-Agent: {USER_AGENT}\r\n\
              \r\n"
         );
         write_all(&mut stream, request.as_bytes())
@@ -671,6 +679,11 @@ mod tests {
             assert!(req.starts_with("GET /media?version=0.1"), "req: {req}");
             assert!(req.contains("Upgrade: websocket"));
             assert!(req.contains("Sec-WebSocket-Protocol: v1.0.0"));
+            // 浏览器 UA 必须与 go-client 拨号 header 同值（EAS-7533）。
+            assert!(
+                req.contains(&format!("User-Agent: {USER_AGENT}")),
+                "handshake must carry the browser User-Agent, req: {req}"
+            );
             let key = req
                 .lines()
                 .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))

@@ -34,6 +34,15 @@ type ServerError struct {
 	Msg  string
 }
 
+// UserAgent is the User-Agent sent on the WebSocket dial. Without it gorilla
+// hands the handshake request to http.Request.Write, which fills in Go's
+// default "Go-http-client/1.1" and exposes the client stack. The value is
+// kept identical across the three call sites that need a browser fingerprint
+// (go-client dial, rust-client handshake, Control-go OA HTTP client) — see
+// rust-client/src/websocket.rs USER_AGENT and Control-go
+// service/access/datastation BrowserUserAgent.
+const UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+
 func (e *ServerError) Error() string {
 	return fmt.Sprintf("server error code=%d msg=%s", e.Code, e.Msg)
 }
@@ -112,6 +121,10 @@ func (c *HikMediaClient) Connect(ctx context.Context) error {
 	url := c.buildMediaURL()
 	header := http.Header{}
 	header.Add("Sec-WebSocket-Protocol", "v1.0.0")
+	// Explicit browser UA: leaving it unset makes gorilla's http.Request.Write
+	// fall back to Go-http-client/1.1. Callers passing their own header keep it
+	// (gorilla copies request headers verbatim, default branch).
+	header.Set("User-Agent", UserAgent)
 
 	conn, _, err := dialer.DialContext(ctx, url, header)
 	if err != nil {
