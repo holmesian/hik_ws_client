@@ -125,6 +125,62 @@ func connectAndPlay(t *testing.T, cfg *HikConfig, ctx context.Context) *HikMedia
 	return c
 }
 
+// TestConnect_SendsBrowserUserAgent pins the browser User-Agent on the dial:
+// with the header unset, gorilla's http.Request.Write fills in Go's default
+// "Go-http-client/1.1". The value must stay identical to rust-client's
+// USER_AGENT and Control-go's datastation.BrowserUserAgent.
+func TestConnect_SendsBrowserUserAgent(t *testing.T) {
+	got := make(chan string, 1)
+	up := websocket.Upgrader{Subprotocols: []string{"v1.0.0"}}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Header.Get("User-Agent")
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}))
+	defer srv.Close()
+
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	cfg := &HikConfig{
+		ProxyHost:  u.Hostname(),
+		ProxyPort:  port,
+		DeviceIP:   "127.0.0.1",
+		DevicePort: 559,
+		Username:   "admin",
+		Password:   "token123",
+		Version:    "0.1",
+		TLSConfig:  &tls.Config{RootCAs: pool},
+	}
+	c := NewHikMediaClient(cfg)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	c.Close()
+
+	select {
+	case ua := <-got:
+		if ua != UserAgent {
+			t.Fatalf("dial User-Agent = %q, want %q", ua, UserAgent)
+		}
+		if ua == "Go-http-client/1.1" {
+			t.Fatal("dial still exposes Go's default User-Agent")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mock did not observe the handshake")
+	}
+}
+
 // TestIntegration_FullStreamFlow exercises the whole receive path in one
 // session: SDP/media info, a protocol video frame, several protocol
 // messages batched into one WebSocket frame, an encrypted-flag frame, a

@@ -41,8 +41,13 @@ GET /media?version=0.1&cipherSuites=0&sessionID=&proxy=[ipv6]:559 HTTP/1.1
 Upgrade: websocket
 Sec-WebSocket-Version: 13
 Sec-WebSocket-Protocol: v1.0.0
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36
 ```
 
+`User-Agent` 为固定浏览器 UA（go-client `hikws.UserAgent` / rust-client
+`websocket::USER_AGENT` / Control-go OA HTTP 客户端三处同值，EAS-7533）：
+不携带时 Go 侧经 `http.Request.Write` 补默认 `Go-http-client/1.1`、Rust 侧
+手搓握手则完全不带，均暴露客户端指纹；上游实测不校验 UA，属主动伪装。
 服务端回 `101 Switching Protocols` 并带回同一子协议。客户端发出的帧必须掩码
 （FIN=1、Opcode=0x02 Binary、MASK=1）；服务端下行帧不掩码。
 

@@ -104,9 +104,19 @@ impl MockConn {
     }
 
     /// 读客户端握手请求并回 101（带正确的 Sec-WebSocket-Accept）。返回请求文本。
+    ///
+    /// 同时校验握手携带浏览器 User-Agent（EAS-7533）：与 go-client 拨号 header
+    /// 同值；所有流程用例经此 accept，断言只此一处。
     pub fn accept_handshake(&mut self) -> String {
         let req = self.read_until(b"\r\n\r\n");
         let req = String::from_utf8_lossy(&req).to_string();
+        assert!(
+            req.contains(&format!(
+                "User-Agent: {}",
+                hik_ws_client::websocket::USER_AGENT
+            )),
+            "handshake must carry the browser User-Agent (EAS-7533), req: {req}"
+        );
         let key = req
             .lines()
             .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
